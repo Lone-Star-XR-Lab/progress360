@@ -14,6 +14,7 @@ let currentProject = null;
 let stages = [];
 let stageTextures = [];
 let stagePos = 0; // float 0..(stages.length-1)
+let fsOverlay;
 
 // Local persistence (per project)
 const STORE_PREFIX = 'p360:proj:';
@@ -144,13 +145,60 @@ function toggleFullscreen(){
 }
 
 document.addEventListener('fullscreenchange', ()=>{
-  if(!fullscreenBtn) return;
-  fullscreenBtn.textContent = document.fullscreenElement ? 'Exit Full Screen' : 'Full Screen';
+  if(fullscreenBtn) {
+    fullscreenBtn.textContent = document.fullscreenElement ? 'Exit Full Screen' : 'Full Screen';
+  }
   onResize();
   // run again after layout settles
   setTimeout(onResize, 50);
   setTimeout(onResize, 200);
+  showFsOverlay(document.fullscreenElement === container || renderer?.xr?.isPresenting === true);
 });
+
+function setupXRControllers(){
+  try{
+    const next = renderer.xr.getController(0);
+    const prev = renderer.xr.getController(1);
+    next.addEventListener('select', ()=> nudgeStage(+1));
+    prev.addEventListener('select', ()=> nudgeStage(-1));
+    next.addEventListener('squeeze', endXRSession);
+    prev.addEventListener('squeeze', endXRSession);
+    scene.add(next); scene.add(prev);
+  }catch{}
+}
+
+function endXRSession(){
+  const s = renderer?.xr?.getSession?.();
+  s?.end?.();
+}
+
+function exitXRorFS(){
+  if(renderer?.xr?.isPresenting){ endXRSession(); return; }
+  if(document.fullscreenElement === container){ document.exitFullscreen?.(); }
+}
+
+function showFsOverlay(show){
+  if(!container) return;
+  if(!fsOverlay){
+    fsOverlay = document.createElement('div');
+    fsOverlay.className = 'fs-overlay';
+    fsOverlay.innerHTML = `
+      <button class="btn ghost" data-action="prev">Prev</button>
+      <button class="btn" data-action="next">Next</button>
+      <button class="btn ghost" data-action="exit">Exit</button>
+    `;
+    fsOverlay.addEventListener('click', (e)=>{
+      const b = e.target.closest('button');
+      if(!b) return;
+      const a = b.dataset.action;
+      if(a==='prev') nudgeStage(-1);
+      if(a==='next') nudgeStage(+1);
+      if(a==='exit') exitXRorFS();
+    });
+    container.appendChild(fsOverlay);
+  }
+  fsOverlay.style.display = show ? 'flex' : 'none';
+}
 
 function setExposure(v, persist = true){
   if(!material) return;
@@ -179,12 +227,12 @@ function initRenderer(){
   // Add VR button only when WebXR is available
   const host = document.createElement('div');
   host.className = 'vr-button-host';
-  if (window.isSecureContext && 'xr' in navigator) {
-    const vrBtn = VRButton.createButton(renderer);
-    host.appendChild(vrBtn);
-  } else {
-    if(statusEl) statusEl.textContent = 'WebXR unavailable (use HTTPS or localhost)';
-  }
+  const vrBtn = VRButton.createButton(renderer);
+  // Ensure the button sits fully inside the container (avoid clipping)
+  vrBtn.style.position = 'static';
+  vrBtn.style.right = '';
+  vrBtn.style.bottom = '';
+  host.appendChild(vrBtn);
   container.appendChild(host);
 
   // Resize when container dimensions change (e.g., modal opens, fullscreen)
@@ -192,6 +240,15 @@ function initRenderer(){
     const ro = new ResizeObserver(()=> onResize());
     ro.observe(container);
   }
+
+  // Hook XR session events
+  renderer.xr.addEventListener('sessionstart', ()=>{
+    showFsOverlay(true);
+    setupXRControllers();
+  });
+  renderer.xr.addEventListener('sessionend', ()=>{
+    showFsOverlay(document.fullscreenElement === container);
+  });
 }
 
 function onResize(){
@@ -409,6 +466,14 @@ export async function openViewer(project){
 
   // Ensure renderer exists now that container is visible
   initRenderer();
+  // Keyboard shortcuts for navigation in fullscreen/VR
+  const onKey = (e)=>{
+    if(e.key === 'ArrowRight') nudgeStage(+1);
+    else if(e.key === 'ArrowLeft') nudgeStage(-1);
+    else if(e.key === 'Escape') exitXRorFS();
+  };
+  window.addEventListener('keydown', onKey);
+  closeViewer._onKey = onKey;
 
   // (Re)size renderer to container
   onResize();
@@ -443,6 +508,7 @@ export function closeViewer(){
   modalEl.setAttribute('aria-hidden', 'true');
   document.body.classList.remove('viewer-open');
   window.removeEventListener('resize', onResize);
+  if(closeViewer._onKey){ window.removeEventListener('keydown', closeViewer._onKey); closeViewer._onKey = null; }
   if(renderer){ renderer.setAnimationLoop(null); }
   // leave canvas & VR button mounted for faster reopen
 }
