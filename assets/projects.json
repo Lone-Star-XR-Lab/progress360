@@ -1,0 +1,36 @@
+{
+  "projects": [
+    {
+      "id": "office",
+      "title": "Office",
+      "folder": "assets/office",
+      "slug": "office",
+      "thumb": "assets/office/000-office.jpg",
+      "meta": { "location": "Main Office" }
+    },
+    {
+      "id": "kitchen",
+      "title": "Kitchen",
+      "folder": "assets/kitchen",
+      "slug": "kitchen",
+      "thumb": "assets/kitchen/000-office.jpg",
+      "meta": { "location": "Kitchen" }
+    },
+    {
+      "id": "bedroom",
+      "title": "Bedroom",
+      "folder": "assets/bedroom",
+      "slug": "bedroom",
+      "thumb": "assets/bedroom/000-bedroom.jpg",
+      "meta": { "location": "Bedroom" }
+    },
+    {
+      "id": "xr-lab",
+      "title": "XR Lab",
+      "folder": "assets/xr-lab",
+      "slug": "xr-lab",
+      "thumb": "assets/xr-lab/000-xr-lab.jpg",
+      "meta": { "location": "XR Lab" }
+    }
+  ]
+}

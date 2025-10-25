@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Progress360</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <!-- Map bare specifiers used by three.js examples to CDN URLs -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+      "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+<header class="site-header">
+<div class="brand">
+<div class="logo-ring" aria-hidden="true"></div>
+<h1>Progress<span class="accent">360</span></h1>
+</div>
+<nav class="tagline">Before • After • Beyond</nav>
+</header>
+
+
+<main>
+<section class="intro">
+<p>Experience campus transformations in immersive 360°. Select a project to view its <strong>before</strong> and <strong>after</strong> panoramas on web, phone, or VR headsets via WebXR.</p>
+</section>
+
+
+<section class="gallery" id="gallery"></section>
+</main>
+
+
+<!-- Viewer Modal -->
+<div id="viewerModal" class="modal" aria-hidden="true">
+<div class="modal-inner">
+<div class="viewer-header">
+  <div class="viewer-title">
+    <span id="viewerProjectTitle">Project</span>
+    <span id="viewerStatus" class="status">Loading…</span>
+  </div>
+  <div class="viewer-tip">Tip: Drag to look around • Press the VR button to enter immersive mode on supported devices.</div>
+  <button id="closeViewer" class="btn ghost" aria-label="Close">✕</button>
+  </div>
+
+
+<div class="viewer-grid">
+  <!-- Left: Stage gallery in its own card -->
+  <aside class="panel card-panel left-panel">
+    <h3 class="panel-title">Gallery</h3>
+    <div id="sideGallery" class="side-gallery"></div>
+  </aside>
+
+  <!-- Center: 360 image in its own card -->
+  <section class="panel card-panel center-panel">
+    <div id="viewerCanvasWrap" class="viewer-canvas-wrap"><!-- canvas here --></div>
+  </section>
+
+  <!-- Right: Adjustments in their own card -->
+  <aside class="panel card-panel right-actions">
+    <h3 class="panel-title">Actions</h3>
+    <div class="controls">
+      <div class="control-group row">
+        <button id="fullscreenBtn" class="btn ghost">Full Screen</button>
+        <button id="recenterBtn" class="btn ghost">Recenter View</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Right: Adjustments in their own card -->
+  <aside class="panel card-panel right-panel">
+    <h3 class="panel-title">Adjustments</h3>
+    <div class="controls">
+      <div class="control-group">
+        <label for="exposureRange">Exposure</label>
+        <input id="exposureRange" type="range" min="0.5" max="2" step="0.01" value="1" />
+        <div class="legend"><span>Darker</span><span>Brighter</span></div>
+      </div>
+      <div class="control-group">
+        <label for="gammaRange">Gamma</label>
+        <input id="gammaRange" type="range" min="0.5" max="2" step="0.01" value="1" />
+        <div class="legend"><span>Lower = brighter</span><span>Higher = darker</span></div>
+      </div>
+      <div class="control-group row">
+        <button id="autoAdjustBtn" class="btn">Auto Adjust</button>
+        <button id="resetAdjustBtn" class="btn ghost">Reset</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Bottom: Navigation in its own card -->
+  <div class="panel card-panel nav-panel">
+    <div class="nav-section">
+      <label for="timelineRange">Timeline</label>
+      <input id="timelineRange" type="range" min="0" max="1" step="0.001" value="0" />
+      <div id="timelineTicks" class="ticks"></div>
+      <div id="timelineLegend" class="legend"></div>
+    </div>
+    <div class="btn-row">
+      <button id="prevBtn" class="btn ghost">Prev</button>
+      <button id="nextBtn" class="btn">Next</button>
+    </div>
+  </div>
+</div>
+</div>
+<div class="modal-backdrop"></div>
+</div>
+
+
+<script type="module" src="./main.js"></script>
+</body>
+</html>
