@@ -15,6 +15,7 @@ let stages = [];
 let stageTextures = [];
 let stagePos = 0; // float 0..(stages.length-1)
 let fsOverlay;
+let fsIndicatorEl;
 
 // Local persistence (per project)
 const STORE_PREFIX = 'p360:proj:';
@@ -84,6 +85,8 @@ function setStagePos(v, persist = true){
   setMix(frac);
   updateTimelineLegendHighlight(i, frac);
   if(persist) saveSettings({ stagePos });
+  // Update overlay indicator if visible
+  if(fsOverlay && fsOverlay.style.display !== 'none') updateFsIndicator();
 }
 
 function nudgeStage(dir){
@@ -141,7 +144,11 @@ function toggleFullscreen(){
   if(!container) return;
   const isFS = document.fullscreenElement === container;
   if(isFS){ document.exitFullscreen?.(); }
-  else{ container.requestFullscreen?.(); }
+  else{
+    const opts = { navigationUI: 'hide' };
+    try{ container.requestFullscreen?.(opts); }
+    catch{ container.requestFullscreen?.(); }
+  }
 }
 
 document.addEventListener('fullscreenchange', ()=>{
@@ -183,9 +190,12 @@ function showFsOverlay(show){
     fsOverlay = document.createElement('div');
     fsOverlay.className = 'fs-overlay';
     fsOverlay.innerHTML = `
-      <button class="btn ghost" data-action="prev">Prev</button>
-      <button class="btn" data-action="next">Next</button>
-      <button class="btn ghost" data-action="exit">Exit</button>
+      <div class="fs-exit"><button class="btn ghost" data-action="exit">Exit</button></div>
+      <div class="fs-nav">
+        <button class="btn big" data-action="prev">Prev</button>
+        <div class="fs-indicator"></div>
+        <button class="btn big" data-action="next">Next</button>
+      </div>
     `;
     fsOverlay.addEventListener('click', (e)=>{
       const b = e.target.closest('button');
@@ -196,8 +206,17 @@ function showFsOverlay(show){
       if(a==='exit') exitXRorFS();
     });
     container.appendChild(fsOverlay);
+    fsIndicatorEl = fsOverlay.querySelector('.fs-indicator');
   }
   fsOverlay.style.display = show ? 'flex' : 'none';
+  if(show) updateFsIndicator();
+}
+
+function updateFsIndicator(){
+  if(!fsIndicatorEl || !stages.length) return;
+  const i = Math.floor(stagePos);
+  const label = stages[i]?.label || `Stage ${i+1}`;
+  fsIndicatorEl.textContent = `${label} • ${i+1}/${stages.length}`;
 }
 
 function setExposure(v, persist = true){
@@ -253,8 +272,15 @@ function initRenderer(){
 
 function onResize(){
   if(!renderer) return;
-  const { clientWidth: w, clientHeight: h } = container;
-  const W = Math.max(1, w), H = Math.max(1, h);
+  const elem = document.fullscreenElement || container;
+  let w = elem?.clientWidth || window.innerWidth;
+  let h = elem?.clientHeight || window.innerHeight;
+  if(!w || !h){
+    const r = elem?.getBoundingClientRect?.();
+    w = r?.width || container.clientWidth;
+    h = r?.height || container.clientHeight;
+  }
+  const W = Math.max(1, Math.floor(w)), H = Math.max(1, Math.floor(h));
   renderer.setSize(W, H);
   if(camera){
     camera.aspect = W / H;

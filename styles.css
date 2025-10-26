@@ -83,8 +83,12 @@ input[type="range"]{width:100%}
 #viewerCanvasWrap .vr-button-host{position:absolute;right:12px;bottom:12px;z-index:6}
 
 /* Overlay controls for fullscreen/VR */
-#viewerCanvasWrap .fs-overlay{position:absolute;left:50%;transform:translateX(-50%);bottom:16px;display:none;gap:10px;z-index:5}
+#viewerCanvasWrap .fs-overlay{position:absolute;inset:0;display:none;z-index:5;pointer-events:auto}
+#viewerCanvasWrap .fs-overlay .fs-exit{position:absolute;top:12px;right:12px}
+#viewerCanvasWrap .fs-overlay .fs-nav{position:absolute;left:50%;transform:translateX(-50%);bottom:16px;display:flex;align-items:center;gap:24px}
+#viewerCanvasWrap .fs-overlay .fs-indicator{padding:8px 14px;border-radius:999px;background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.25);color:#fff;font-weight:700;min-width:220px;text-align:center}
 #viewerCanvasWrap .fs-overlay .btn{backdrop-filter:blur(4px)}
+#viewerCanvasWrap .fs-overlay .btn.big{padding:14px 22px;font-size:1.05rem}
 
 .side-gallery{display:grid;grid-template-columns:1fr;gap:8px;padding:10px;overflow:auto}
 .side-gallery .thumb{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:8px;border:1px solid rgba(255,255,255,.08);opacity:.85;cursor:pointer}
@@ -105,4 +109,5 @@ body.viewer-open{overflow:hidden}
 body.viewer-open .site-header{display:none}
 
 /* Ensure canvas fits container; renderer resizes it as well */
-#viewerCanvasWrap canvas{display:block;max-width:100%;max-height:100%;}
+#viewerCanvasWrap canvas{display:block;width:100%;height:100%;}
+#viewerCanvasWrap:fullscreen{margin:0;border-radius:0}
