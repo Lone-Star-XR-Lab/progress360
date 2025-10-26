@@ -59,7 +59,7 @@ async function discoverStages(p){
   const stages = [];
   let misses = 0;
   let lastFoundIndex = -1;
-  for(let i=0;i<200;i++){
+  for(let i=0;i<40;i++){
     const url = `${folder}/${pad(i)}-${slug}.jpg`;
     // eslint-disable-next-line no-await-in-loop
     const ok = await imageExists(url);
@@ -70,13 +70,14 @@ async function discoverStages(p){
       lastFoundIndex = i;
     } else {
       misses++;
-      if(stages.length && misses >= 8) break;
-      if(i >= 60) break;
+      // Stop probing quickly once we encounter a gap after finding at least one stage
+      if(stages.length && misses >= 2) break;
+      if(i >= 12) break;
     }
   }
   // Optional 999-current: only probe if we've already found later-stage images
   // to avoid a wasted network request when projects are small.
-  if(lastFoundIndex >= 50){
+  if(lastFoundIndex >= 20){
     const url999 = `${folder}/999-${slug}.jpg`;
     if(await imageExists(url999)) stages.push({ label: 'Current', url: url999 });
   }

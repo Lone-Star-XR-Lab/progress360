@@ -61,37 +61,49 @@
     <div id="viewerCanvasWrap" class="viewer-canvas-wrap"><!-- canvas here --></div>
   </section>
 
-  <!-- Right: Adjustments in their own card -->
-  <aside class="panel card-panel right-actions">
-    <h3 class="panel-title">Actions</h3>
-    <div class="controls">
-      <div class="control-group row">
-        <button id="fullscreenBtn" class="btn ghost">Full Screen</button>
-        <button id="recenterBtn" class="btn ghost">Recenter View</button>
+  <!-- Right: Rail stacking info, actions, adjustments -->
+  <div class="right-rail">
+    <aside class="panel card-panel right-info">
+      <h3 class="panel-title">Info</h3>
+      <div class="info-panel">
+        <div class="info-row"><span class="k">Stage</span><span id="infoStage" class="v">—</span></div>
+        <div class="info-row"><span class="k">Taken</span><span id="infoTaken" class="v">—</span></div>
+        <div class="info-row"><span class="k">Location</span><span id="infoLocation" class="v">—</span></div>
       </div>
-    </div>
-  </aside>
+    </aside>
 
-  <!-- Right: Adjustments in their own card -->
-  <aside class="panel card-panel right-panel">
-    <h3 class="panel-title">Adjustments</h3>
-    <div class="controls">
-      <div class="control-group">
-        <label for="exposureRange">Exposure</label>
-        <input id="exposureRange" type="range" min="0.5" max="2" step="0.01" value="1" />
-        <div class="legend"><span>Darker</span><span>Brighter</span></div>
+    <aside class="panel card-panel right-actions">
+      <h3 class="panel-title">Actions</h3>
+      <div class="controls">
+        <div class="control-group row">
+          <button id="fullscreenBtn" class="btn ghost">Full Screen</button>
+          <button id="recenterBtn" class="btn ghost">Recenter View</button>
+          <button id="setFrontBtn" class="btn ghost">Set Front</button>
+          <button id="resetFrontBtn" class="btn ghost">Reset Front</button>
+        </div>
       </div>
-      <div class="control-group">
-        <label for="gammaRange">Gamma</label>
-        <input id="gammaRange" type="range" min="0.5" max="2" step="0.01" value="1" />
-        <div class="legend"><span>Lower = brighter</span><span>Higher = darker</span></div>
+    </aside>
+
+    <aside class="panel card-panel right-panel">
+      <h3 class="panel-title">Adjustments</h3>
+      <div class="controls">
+        <div class="control-group">
+          <label for="exposureRange">Exposure</label>
+          <input id="exposureRange" type="range" min="0.5" max="2" step="0.01" value="1" />
+          <div class="legend"><span>Darker</span><span>Brighter</span></div>
+        </div>
+        <div class="control-group">
+          <label for="gammaRange">Gamma</label>
+          <input id="gammaRange" type="range" min="0.5" max="2" step="0.01" value="1" />
+          <div class="legend"><span>Lower = brighter</span><span>Higher = darker</span></div>
+        </div>
+        <div class="control-group row">
+          <button id="autoAdjustBtn" class="btn">Auto Adjust</button>
+          <button id="resetAdjustBtn" class="btn ghost">Reset</button>
+        </div>
       </div>
-      <div class="control-group row">
-        <button id="autoAdjustBtn" class="btn">Auto Adjust</button>
-        <button id="resetAdjustBtn" class="btn ghost">Reset</button>
-      </div>
-    </div>
-  </aside>
+    </aside>
+  </div>
 
   <!-- Bottom: Navigation in its own card -->
   <div class="panel card-panel nav-panel">
@@ -110,6 +122,10 @@
 </div>
 <div class="modal-backdrop"></div>
 </div>
+
+
+<!-- Toasts -->
+<div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="true"></div>
 
 
 <script type="module" src="./main.js"></script>

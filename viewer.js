@@ -8,7 +8,8 @@ let modalEl, container, titleEl, statusEl,
     timelineRange, timelineLegend,
     timelineTicks,
     exposureRange, gammaRange, autoAdjustBtn, resetAdjustBtn,
-    prevBtn, nextBtn, recenterBtn, closeBtn, fullscreenBtn, sideGallery;
+    prevBtn, nextBtn, recenterBtn, closeBtn, fullscreenBtn, setFrontBtn, resetFrontBtn, sideGallery;
+let infoStageEl, infoTakenEl, infoLocationEl;
 let mixUniform;
 let currentProject = null;
 let stages = [];
@@ -16,6 +17,16 @@ let stageTextures = [];
 let stagePos = 0; // float 0..(stages.length-1)
 let fsOverlay;
 let fsIndicatorEl;
+let currentStageIndex = 0;
+let lastRelDelta = null; // { dTheta, dPhi } relative to stage front
+let toastHost;
+
+// Per-stage orientation & fronts (persisted)
+// Store angles instead of quaternions for OrbitControls
+// orients[index] -> [theta, phi]
+// fronts[index]  -> [theta, phi]
+let stageOrients = {};
+let stageFronts = {};
 
 // Local persistence (per project)
 const STORE_PREFIX = 'p360:proj:';
@@ -27,7 +38,14 @@ function loadSettings(){
 function saveSettings(partial){
   try {
     const prev = loadSettings();
-    const next = { ...prev, ...partial };
+    const next = { ...prev };
+    for(const k of Object.keys(partial)){
+      if(typeof partial[k] === 'object' && partial[k] && !Array.isArray(partial[k])){
+        next[k] = { ...(prev[k]||{}), ...(partial[k]||{}) };
+      }else{
+        next[k] = partial[k];
+      }
+    }
     localStorage.setItem(storeKey(), JSON.stringify(next));
   } catch {}
 }
@@ -50,7 +68,13 @@ function ensureUIRefs(){
   recenterBtn = document.getElementById('recenterBtn');
   fullscreenBtn = document.getElementById('fullscreenBtn');
   closeBtn = document.getElementById('closeViewer');
+  setFrontBtn = document.getElementById('setFrontBtn');
+  resetFrontBtn = document.getElementById('resetFrontBtn');
   sideGallery = document.getElementById('sideGallery');
+  infoStageEl = document.getElementById('infoStage');
+  infoTakenEl = document.getElementById('infoTaken');
+  infoLocationEl = document.getElementById('infoLocation');
+  toastHost = document.getElementById('toastHost');
 
   if(!modalEl || !container) throw new Error('Viewer UI elements not found');
 
@@ -65,28 +89,70 @@ function ensureUIRefs(){
   gammaRange?.addEventListener('input', (e)=> setGamma(parseFloat(e.target.value)) );
   autoAdjustBtn?.addEventListener('click', ()=> autoAdjust());
   resetAdjustBtn?.addEventListener('click', ()=> { setExposure(1.0); setGamma(1.0); });
-  recenterBtn?.addEventListener('click', ()=> { if(controls) controls.reset(); });
+  recenterBtn?.addEventListener('click', ()=> recenterToStageFront());
+  setFrontBtn?.addEventListener('click', ()=> setCurrentStageFront());
+  resetFrontBtn?.addEventListener('click', ()=> resetCurrentStageFront());
+}
+
+// Toasts
+function showToast(message, type = 'info', timeoutMs = 2600){
+  if(!toastHost){ toastHost = document.getElementById('toastHost'); }
+  if(!toastHost) return;
+  const el = document.createElement('div');
+  el.className = `toast ${type} toast-enter`;
+  el.textContent = message;
+  toastHost.appendChild(el);
+  setTimeout(()=>{
+    el.classList.remove('toast-enter');
+    el.classList.add('toast-exit');
+    setTimeout(()=> el.remove(), 200);
+  }, timeoutMs);
 }
 
 function setMix(v){ if(mixUniform) mixUniform.value = v; }
 
 function setStagePos(v, persist = true){
   if(!stages.length) return;
-  stagePos = Math.min(stages.length-1, Math.max(0, v));
-  if(timelineRange) timelineRange.value = String(stagePos);
-  const i = Math.floor(stagePos);
-  const frac = stagePos - i;
-  const texA = stageTextures[i];
-  const texB = stageTextures[Math.min(i+1, stageTextures.length-1)] || texA;
+  const targetPos = Math.min(stages.length-1, Math.max(0, v));
+  if(timelineRange) timelineRange.value = String(targetPos);
+  const newIndex = Math.floor(targetPos);
+  const changedIndex = (newIndex !== currentStageIndex);
+
+  // Compute relative view delta (angles) to current stage's front before switching
+  if(changedIndex && camera){
+    const oldFront = stageFronts[currentStageIndex];
+    if(oldFront){
+      const ang = getAngles();
+      const dTheta = normAngle(ang.theta - oldFront[0]);
+      const dPhi = ang.phi - oldFront[1];
+      lastRelDelta = { dTheta, dPhi };
+    } else lastRelDelta = null;
+  }
+
+  stagePos = targetPos;
+  currentStageIndex = newIndex;
+  const frac = stagePos - newIndex;
+  const texA = stageTextures[newIndex];
+  const texB = stageTextures[Math.min(newIndex+1, stageTextures.length-1)] || texA;
   if(material){
     material.uniforms.map1.value = texA;
     material.uniforms.map2.value = texB;
   }
   setMix(frac);
-  updateTimelineLegendHighlight(i, frac);
+  updateTimelineLegendHighlight(newIndex, frac);
   if(persist) saveSettings({ stagePos });
   // Update overlay indicator if visible
   if(fsOverlay && fsOverlay.style.display !== 'none') updateFsIndicator();
+  updateInfoPanel();
+  if(changedIndex){
+    // If both stages have a defined front and we have a delta, carry view over (angles)
+    const newFront = stageFronts[newIndex];
+    if(lastRelDelta && newFront){
+      setAngles(normAngle(newFront[0] + lastRelDelta.dTheta), newFront[1] + lastRelDelta.dPhi);
+    } else {
+      // Do not auto-rotate when fronts are not set; keep current view.
+    }
+  }
 }
 
 function nudgeStage(dir){
@@ -219,6 +285,182 @@ function updateFsIndicator(){
   fsIndicatorEl.textContent = `${label} • ${i+1}/${stages.length}`;
 }
 
+// ---------- Info panel (EXIF + project meta) ----------
+const exifCache = new Map(); // url -> { taken, gpsText, gps }
+
+function updateInfoPanel(){
+  if(!stages.length) return;
+  const i = Math.floor(stagePos);
+  const stage = stages[i];
+  if(infoStageEl) infoStageEl.textContent = stage?.label || `Stage ${i+1}`;
+  const url = stage?.url;
+  if(!url){
+    if(infoTakenEl) infoTakenEl.textContent = '—';
+    if(infoLocationEl) infoLocationEl.textContent = currentProject?.meta?.location || '—';
+    return;
+  }
+  if(exifCache.has(url)){
+    const { taken, gpsText, gps } = exifCache.get(url);
+    if(infoTakenEl) infoTakenEl.textContent = taken || '—';
+    if(infoLocationEl){
+      if(gps && Number.isFinite(gps.lat) && Number.isFinite(gps.lon)){
+        infoLocationEl.innerHTML = `<a href="https://www.google.com/maps?q=${gps.lat},${gps.lon}" target="_blank" rel="noopener">${gpsText}</a>`;
+      } else {
+        infoLocationEl.textContent = gpsText || (currentProject?.meta?.location || '—');
+      }
+    }
+    return;
+  }
+  // Parse EXIF for date/time and GPS; fall back to HTTP Last-Modified
+  fetch(url + (url.includes('?')?'&':'?') + 'cb=' + Date.now())
+    .then(async (r)=>{
+      const lastModified = r.headers.get('last-modified');
+      const buf = await r.arrayBuffer();
+      const meta = parseBasicExif(buf) || {};
+      const exifDate = meta.dateTimeOriginal || meta.dateTimeDigitized || meta.dateTime;
+      const taken = formatTaken(exifDate) || formatHttpDate(lastModified) || '';
+      const gps = meta?.gps;
+      const gpsText = gps ? `${gps.lat.toFixed(6)}, ${gps.lon.toFixed(6)}` : '';
+      exifCache.set(url, { taken, gpsText, gps });
+      if(infoTakenEl) infoTakenEl.textContent = taken || '—';
+      if(infoLocationEl){
+        if(gps && Number.isFinite(gps.lat) && Number.isFinite(gps.lon)){
+          infoLocationEl.innerHTML = `<a href="https://www.google.com/maps?q=${gps.lat},${gps.lon}" target="_blank" rel="noopener">${gpsText}</a>`;
+        } else {
+          infoLocationEl.textContent = gpsText || (currentProject?.meta?.location || '—');
+        }
+      }
+    })
+    .catch(()=>{
+      if(infoTakenEl) infoTakenEl.textContent = '—';
+      if(infoLocationEl) infoLocationEl.textContent = currentProject?.meta?.location || '—';
+    });
+}
+
+function parseBasicExif(arrayBuffer){
+  const data = new DataView(arrayBuffer);
+  let offset = 2;
+  if(data.getUint16(0) !== 0xFFD8) return {};
+  while(offset < data.byteLength){
+    const marker = data.getUint16(offset); offset += 2;
+    const size = data.getUint16(offset); offset += 2;
+    if(marker === 0xFFE1){ // APP1
+      // Check Exif header
+      if(getString(data, offset, 4) !== 'Exif') break;
+      const tiffOffset = offset + 6; // 'Exif\0\0'
+      return readTIFF(data, tiffOffset);
+    } else {
+      offset += size - 2;
+    }
+  }
+  return {};
+}
+
+function readTIFF(view, tiffOffset){
+  const endian = view.getUint16(tiffOffset);
+  const little = endian === 0x4949;
+  const getU16 = (o)=> little? view.getUint16(o,true):view.getUint16(o,false);
+  const getU32 = (o)=> little? view.getUint32(o,true):view.getUint32(o,false);
+  const getRational = (o)=>{
+    const num = getU32(o); const den = getU32(o+4);
+    return den? num/den : 0;
+  };
+  const firstIFD = getU32(tiffOffset + 4) + tiffOffset;
+  const base = tiffOffset;
+  function readIFD(ifdOffset){
+    const count = getU16(ifdOffset);
+    const tags = new Map();
+    let p = ifdOffset + 2;
+    for(let i=0;i<count;i++){
+      const tag = getU16(p); const type = getU16(p+2); const num = getU32(p+4); const valueOff = p+8;
+      let valOff = getU32(valueOff) + base;
+      let value = null;
+      if(type === 2){ // ASCII
+        value = getAscii(view, (num>4? valOff : valueOff), num);
+      }else if(type === 3){ // SHORT
+        value = (num>1)? Array.from({length:num}, (_,$)=> getU16(valOff+2*$)) : getU16(valueOff);
+      }else if(type === 4){ // LONG
+        value = (num>1)? Array.from({length:num}, (_,$)=> getU32(valOff+4*$)) : getU32(valueOff);
+      }else if(type === 5){ // RATIONAL
+        if(num>1){ value = Array.from({length:num}, (_,$)=> getRational(valOff+8*$)); }
+        else value = getRational(valOff);
+      }
+      tags.set(tag, value);
+      p += 12;
+    }
+    const next = getU32(p);
+    return { tags, next: next? next+base:0 };
+  }
+  const ifd0 = readIFD(firstIFD);
+  const exifPtr = ifd0.tags.get(0x8769);
+  const gpsPtr = ifd0.tags.get(0x8825);
+  let meta = {};
+  if(exifPtr){
+    const exifIFD = readIFD(exifPtr + base);
+    const dto = exifIFD.tags.get(0x9003); // DateTimeOriginal
+    const dtd = exifIFD.tags.get(0x9004); // DateTimeDigitized
+    const dt0 = ifd0.tags.get(0x0132);    // ModifyDate/DateTime
+    if(dto) meta.dateTimeOriginal = String(dto).trim();
+    if(dtd) meta.dateTimeDigitized = String(dtd).trim();
+    if(!meta.dateTimeOriginal && dt0) meta.dateTime = String(dt0).trim();
+  } else {
+    const dto0 = ifd0.tags.get(0x0132);
+    if(dto0) meta.dateTime = String(dto0).trim();
+  }
+  if(gpsPtr){
+    const gpsIFD = readIFD(gpsPtr + base);
+    const latRef = gpsIFD.tags.get(0x0001);
+    const lat = gpsIFD.tags.get(0x0002);
+    const lonRef = gpsIFD.tags.get(0x0003);
+    const lon = gpsIFD.tags.get(0x0004);
+    if(lat && lon){
+      const latVal = dmsToDeg(lat) * (latRef==='S'?-1:1);
+      const lonVal = dmsToDeg(lon) * (lonRef==='W'?-1:1);
+      meta.gps = { lat: latVal, lon: lonVal };
+    }
+  }
+  return meta;
+}
+
+function dmsToDeg(arr){
+  if(Array.isArray(arr)) return (arr[0] + arr[1]/60 + arr[2]/3600);
+  return arr || 0;
+}
+
+function getAscii(view, offset, len){
+  let s='';
+  for(let i=0;i<len-1;i++) s += String.fromCharCode(view.getUint8(offset+i));
+  return s;
+}
+
+function getString(view, offset, len){
+  let s='';
+  for(let i=0;i<len;i++) s += String.fromCharCode(view.getUint8(offset+i));
+  return s;
+}
+
+function formatTaken(exifDate){
+  if(!exifDate) return '';
+  // EXIF format: YYYY:MM:DD HH:MM:SS
+  const m = /^([0-9]{4}):([0-9]{2}):([0-9]{2})[ T]([0-9]{2}):([0-9]{2}):([0-9]{2})/.exec(exifDate);
+  if(!m) return exifDate;
+  const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}`;
+  try{
+    const d = new Date(iso);
+    if(isNaN(d.getTime())) return exifDate;
+    return d.toLocaleString();
+  }catch{ return exifDate; }
+}
+
+function formatHttpDate(hdr){
+  if(!hdr) return '';
+  try{
+    const d = new Date(hdr);
+    if(isNaN(d.getTime())) return '';
+    return d.toLocaleString();
+  }catch{ return ''; }
+}
+
 function setExposure(v, persist = true){
   if(!material) return;
   material.uniforms.exposure.value = v;
@@ -268,6 +510,75 @@ function initRenderer(){
   renderer.xr.addEventListener('sessionend', ()=>{
     showFsOverlay(document.fullscreenElement === container);
   });
+}
+
+function getAngles(){
+  if(!controls) return { theta:0, phi:Math.PI/2 };
+  return { theta: controls.getAzimuthalAngle(), phi: controls.getPolarAngle() };
+}
+function normAngle(a){
+  if(!isFinite(a)) return 0;
+  while(a <= -Math.PI) a += Math.PI*2;
+  while(a > Math.PI) a -= Math.PI*2;
+  return a;
+}
+function setAngles(theta, phi){
+  if(!controls) return;
+  const curr = getAngles();
+  const dTheta = curr.theta - theta;
+  const dPhi = curr.phi - phi;
+  // Use API methods to avoid touching internals
+  if(typeof controls.rotateLeft === 'function') controls.rotateLeft(dTheta);
+  if(typeof controls.rotateUp === 'function') controls.rotateUp(dPhi);
+  controls.update();
+}
+
+function applySavedOrientationForStage(index){
+  if(stageOrients && stageOrients[index]){
+    const a = stageOrients[index];
+    setAngles(a[0], a[1]);
+    return;
+  }
+  if(stageFronts && stageFronts[index]){
+    const a = stageFronts[index];
+    setAngles(a[0], a[1]);
+    return;
+  }
+}
+
+function setCurrentStageFront(){
+  if(!controls) return;
+  const ang = getAngles();
+  stageFronts[currentStageIndex] = [ang.theta, ang.phi];
+  saveSettings({ fronts: { [currentStageIndex]: stageFronts[currentStageIndex] } });
+  if(statusEl) statusEl.textContent = 'Front saved for this stage';
+  showToast('Front saved for this stage', 'success');
+}
+
+function recenterToStageFront(){
+  if(stageFronts[currentStageIndex]){
+    const a = stageFronts[currentStageIndex];
+    setAngles(a[0], a[1]);
+  } else if(stageOrients[currentStageIndex]){
+    const a = stageOrients[currentStageIndex];
+    setAngles(a[0], a[1]);
+  } else {
+    controls?.reset?.();
+  }
+}
+
+function resetCurrentStageFront(){
+  if(stageFronts[currentStageIndex]){
+    delete stageFronts[currentStageIndex];
+    // Persist full map (replace), not merged
+    try{
+      const s = loadSettings();
+      s.fronts = { ...stageFronts };
+      localStorage.setItem(storeKey(), JSON.stringify(s));
+    }catch{}
+    if(statusEl) statusEl.textContent = 'Front reset for this stage';
+    showToast('Front reset for this stage', 'info');
+  }
 }
 
 function onResize(){
@@ -358,9 +669,11 @@ async function autoAdjust(){
     setExposure(exposure);
     setGamma(gamma);
     if(statusEl) statusEl.textContent = 'Auto adjustment applied';
+    showToast('Auto adjustment applied', 'success');
   }catch(err){
     console.warn('Auto adjust failed', err);
     if(statusEl) statusEl.textContent = 'Auto adjustment failed';
+    showToast('Auto adjustment failed', 'error');
   }
 }
 
@@ -444,6 +757,12 @@ async function buildScene({ title, stages: stageDefs }){
   controls.enableZoom = false;
   controls.enablePan = false;
   controls.rotateSpeed = 0.3;
+  controls.addEventListener('change', ()=> {
+    if(!stages.length) return;
+    const ang = getAngles();
+    stageOrients[currentStageIndex] = [ang.theta, ang.phi];
+    saveSettings({ orients: { [currentStageIndex]: stageOrients[currentStageIndex] } });
+  });
 
   // Determine stages list from project
   stages = Array.isArray(stageDefs) ? stageDefs.filter(s=> !!s?.url) : [];
@@ -476,6 +795,12 @@ async function buildScene({ title, stages: stageDefs }){
   setStagePos(0.0, false);
   setExposure(1.0, false);
   setGamma(1.0, false);
+  updateInfoPanel();
+  // Restore saved per-stage orientations/fronts
+  const saved = loadSettings();
+  stageOrients = saved.orients || {};
+  stageFronts = saved.fronts || {};
+  applySavedOrientationForStage(0);
   animate();
 }
 
@@ -523,6 +848,10 @@ export async function openViewer(project){
     if(typeof saved.stagePos === 'number') setStagePos(saved.stagePos, false);
     if(typeof saved.exposure === 'number') setExposure(saved.exposure, false);
     if(typeof saved.gamma === 'number') setGamma(saved.gamma, false);
+    // Load saved orientation/front maps
+    stageOrients = saved.orients || {};
+    stageFronts = saved.fronts || {};
+    applySavedOrientationForStage(currentStageIndex);
   }catch(err){
     console.error(err);
     if(statusEl) statusEl.textContent = 'Failed to load images';
