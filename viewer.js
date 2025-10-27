@@ -8,18 +8,20 @@ let modalEl, container, titleEl, statusEl,
     timelineRange, timelineLegend,
     timelineTicks,
     exposureRange, gammaRange, autoAdjustBtn, resetAdjustBtn,
-    prevBtn, nextBtn, recenterBtn, closeBtn, fullscreenBtn, setFrontBtn, resetFrontBtn, sideGallery;
+    prevBtn, nextBtn, recenterBtn, closeBtn, fullscreenBtn, setFrontBtn, resetFrontBtn, audioBtn, sideGallery;
 let infoStageEl, infoTakenEl, infoLocationEl;
 let mixUniform;
 let currentProject = null;
 let stages = [];
 let stageTextures = [];
+let stageVideos = [];
 let stagePos = 0; // float 0..(stages.length-1)
 let fsOverlay;
 let fsIndicatorEl;
 let currentStageIndex = 0;
 let lastRelDelta = null; // { dTheta, dPhi } relative to stage front
 let toastHost;
+let audioEnabled = false;
 
 // Per-stage orientation & fronts (persisted)
 // Store angles instead of quaternions for OrbitControls
@@ -70,6 +72,7 @@ function ensureUIRefs(){
   closeBtn = document.getElementById('closeViewer');
   setFrontBtn = document.getElementById('setFrontBtn');
   resetFrontBtn = document.getElementById('resetFrontBtn');
+  audioBtn = document.getElementById('audioBtn');
   sideGallery = document.getElementById('sideGallery');
   infoStageEl = document.getElementById('infoStage');
   infoTakenEl = document.getElementById('infoTaken');
@@ -92,6 +95,7 @@ function ensureUIRefs(){
   recenterBtn?.addEventListener('click', ()=> recenterToStageFront());
   setFrontBtn?.addEventListener('click', ()=> setCurrentStageFront());
   resetFrontBtn?.addEventListener('click', ()=> resetCurrentStageFront());
+  audioBtn?.addEventListener('click', ()=> setAudioEnabled(!audioEnabled));
 }
 
 // Toasts
@@ -107,6 +111,40 @@ function showToast(message, type = 'info', timeoutMs = 2600){
     el.classList.add('toast-exit');
     setTimeout(()=> el.remove(), 200);
   }, timeoutMs);
+}
+
+function setAudioEnabled(flag){
+  audioEnabled = !!flag;
+  if(audioBtn){ audioBtn.textContent = audioEnabled ? 'Audio On' : 'Audio Off'; }
+  // update overlay button label if present
+  if(fsOverlay){
+    const ab = fsOverlay.querySelector('button[data-action="audio"]');
+    if(ab) ab.textContent = audioEnabled ? 'Audio On' : 'Audio Off';
+  }
+  // Apply to current stage
+  applyAudioForCurrent();
+  showToast(audioEnabled ? 'Audio enabled' : 'Audio muted', 'info');
+}
+
+function applyAudioForCurrent(){
+  if(!stageVideos || !stageVideos.length) return;
+  // Mute all, then unmute current if enabled
+  for(const v of stageVideos){ try{ if(v) v.muted = true; }catch{} }
+  const v = stageVideos[currentStageIndex];
+  if(audioEnabled && v){
+    try{ v.muted = false; safePlay(v); }catch{}
+  }
+}
+
+function safePlay(video){
+  if(!video || typeof video.play !== 'function') return;
+  // Defer to avoid immediate pause->play race
+  setTimeout(()=>{
+    try{
+      const p = video.play();
+      if(p && typeof p.catch === 'function') p.catch(()=>{});
+    }catch{}
+  }, 0);
 }
 
 function setMix(v){ if(mixUniform) mixUniform.value = v; }
@@ -153,6 +191,25 @@ function setStagePos(v, persist = true){
       // Do not auto-rotate when fronts are not set; keep current view.
     }
   }
+  playStageMedia(currentStageIndex);
+}
+
+function playStageMedia(index){
+  if(!stageVideos || !stageVideos.length) return;
+  const keepA = index;
+  const keepB = Math.min(index+1, stageVideos.length-1);
+  // Pause and mute all that aren't active
+  for(let i=0;i<stageVideos.length;i++){
+    const v = stageVideos[i];
+    if(!v) continue;
+    if(i !== keepA && i !== keepB){ try{ v.pause(); v.muted = true; }catch{} }
+  }
+  const v1 = stageVideos[keepA];
+  const v2 = stageVideos[keepB];
+  if(v1) safePlay(v1);
+  if(v2 && v2 !== v1) safePlay(v2);
+  // If audio enabled, unmute only current stage
+  if(audioEnabled && v1){ v1.muted = false; safePlay(v1); }
 }
 
 function nudgeStage(dir){
@@ -256,7 +313,10 @@ function showFsOverlay(show){
     fsOverlay = document.createElement('div');
     fsOverlay.className = 'fs-overlay';
     fsOverlay.innerHTML = `
-      <div class="fs-exit"><button class="btn ghost" data-action="exit">Exit</button></div>
+      <div class="fs-exit">
+        <button class="btn ghost" data-action="audio">Audio Off</button>
+        <button class="btn ghost" data-action="exit">Exit</button>
+      </div>
       <div class="fs-nav">
         <button class="btn big" data-action="prev">Prev</button>
         <div class="fs-indicator"></div>
@@ -269,10 +329,13 @@ function showFsOverlay(show){
       const a = b.dataset.action;
       if(a==='prev') nudgeStage(-1);
       if(a==='next') nudgeStage(+1);
+      if(a==='audio') setAudioEnabled(!audioEnabled);
       if(a==='exit') exitXRorFS();
     });
     container.appendChild(fsOverlay);
     fsIndicatorEl = fsOverlay.querySelector('.fs-indicator');
+    const ab = fsOverlay.querySelector('button[data-action="audio"]');
+    if(ab) ab.textContent = audioEnabled ? 'Audio On' : 'Audio Off';
   }
   fsOverlay.style.display = show ? 'flex' : 'none';
   if(show) updateFsIndicator();
@@ -718,19 +781,39 @@ async function loadStages(urls){
   const loader = new THREE.TextureLoader();
   const loadTex = (url)=> new Promise((res,rej)=> loader.load(url, (t)=> res(t), undefined, rej));
   const texs = [];
+  stageVideos = [];
   for(const url of urls){
     try{
-      const t = await loadTex(url);
-      t.colorSpace = THREE.SRGBColorSpace;
-      t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
-      texs.push(t);
+      if(/\.(mp4|webm|ogg)(\?|$)/i.test(url)){
+        const video = document.createElement('video');
+        video.src = url;
+        video.crossOrigin = 'anonymous';
+        video.loop = true;
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = 'auto';
+        // Do not auto play here; will be started when stage becomes active
+        const tex = new THREE.VideoTexture(video);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+        tex.needsUpdate = true;
+        texs.push(tex);
+        stageVideos.push(video);
+      } else {
+        const t = await loadTex(url);
+        t.colorSpace = THREE.SRGBColorSpace;
+        t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+        texs.push(t);
+        stageVideos.push(null);
+      }
     }catch(err){
       console.warn('Failed to load stage', url, err);
       texs.push(texs[texs.length-1] || null);
+      stageVideos.push(stageVideos[stageVideos.length-1] || null);
     }
   }
   // replace any nulls with last valid
-  for(let i=0;i<texs.length;i++) if(!texs[i]) texs[i] = texs[i-1] || texs.find(Boolean);
+  for(let i=0;i<texs.length;i++) if(!texs[i]) { texs[i] = texs[i-1] || texs.find(Boolean); stageVideos[i] = stageVideos[i-1] || null; }
   return texs;
 }
 
@@ -801,6 +884,8 @@ async function buildScene({ title, stages: stageDefs }){
   stageOrients = saved.orients || {};
   stageFronts = saved.fronts || {};
   applySavedOrientationForStage(0);
+  // start initial video(s)
+  playStageMedia(0);
   animate();
 }
 
@@ -865,5 +950,7 @@ export function closeViewer(){
   window.removeEventListener('resize', onResize);
   if(closeViewer._onKey){ window.removeEventListener('keydown', closeViewer._onKey); closeViewer._onKey = null; }
   if(renderer){ renderer.setAnimationLoop(null); }
+  // pause any videos
+  if(stageVideos && stageVideos.length){ for(const v of stageVideos){ try{ v && v.pause(); }catch{} } }
   // leave canvas & VR button mounted for faster reopen
 }

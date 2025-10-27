@@ -60,17 +60,24 @@ async function discoverStages(p){
   let misses = 0;
   let lastFoundIndex = -1;
   for(let i=0;i<40;i++){
-    const url = `${folder}/${pad(i)}-${slug}.jpg`;
-    // eslint-disable-next-line no-await-in-loop
-    const ok = await imageExists(url);
-    if(ok){
+    const n = pad(i);
+    const candidates = [
+      `${folder}/${n}-${slug}.jpg`,
+      `${folder}/${n}-${slug}.mp4`
+    ];
+    let foundUrl = null;
+    for(const url of candidates){
+      // eslint-disable-next-line no-await-in-loop
+      const ok = url.endsWith('.jpg') ? await imageExists(url) : await assetExists(url);
+      if(ok){ foundUrl = url; break; }
+    }
+    if(foundUrl){
       const label = i === 0 ? 'Start' : (i === 999 ? 'Current' : `Stage ${stages.length+1}`);
-      stages.push({ label, url });
+      stages.push({ label, url: foundUrl });
       misses = 0;
       lastFoundIndex = i;
     } else {
       misses++;
-      // Stop probing quickly once we encounter a gap after finding at least one stage
       if(stages.length && misses >= 2) break;
       if(i >= 12) break;
     }
@@ -78,8 +85,10 @@ async function discoverStages(p){
   // Optional 999-current: only probe if we've already found later-stage images
   // to avoid a wasted network request when projects are small.
   if(lastFoundIndex >= 20){
-    const url999 = `${folder}/999-${slug}.jpg`;
-    if(await imageExists(url999)) stages.push({ label: 'Current', url: url999 });
+    const jpg999 = `${folder}/999-${slug}.jpg`;
+    const mp999 = `${folder}/999-${slug}.mp4`;
+    if(await imageExists(jpg999)) stages.push({ label: 'Current', url: jpg999 });
+    else if(await assetExists(mp999)) stages.push({ label: 'Current', url: mp999 });
   }
   return stages;
 }
@@ -164,6 +173,13 @@ function imageExists(url){
     i.onerror = ()=> res(false);
     i.src = url + (url.includes('?')?'&':'?') + 'cb=' + Date.now();
   });
+}
+
+async function assetExists(url){
+  try{
+    const r = await fetch(url, { method:'HEAD' });
+    return r.ok;
+  }catch{ return false; }
 }
 
 function getProjectSlug(p){

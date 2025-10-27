@@ -31,6 +31,22 @@
       "slug": "xr-lab",
       "thumb": "assets/xr-lab/000-xr-lab.jpg",
       "meta": { "location": "XR Lab" }
+    },
+    {
+      "id": "deck",
+      "title": "deck",
+      "folder": "assets/deck",
+      "slug": "deck",
+      "thumb": "assets/deck/000-deck.jpg",
+      "meta": { "location": "Deck" }
+    },
+    {
+      "id": "backyard",
+      "title": "backyard",
+      "folder": "assets/backyard",
+      "slug": "backyard",
+      "thumb": "assets/backyard/000-backyard.jpg",
+      "meta": { "location": "backyard" }
     }
   ]
 }
