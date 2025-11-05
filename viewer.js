@@ -8,8 +8,10 @@ let modalEl, container, titleEl, statusEl,
     timelineRange, timelineLegend,
     timelineTicks,
     exposureRange, gammaRange, autoAdjustBtn, resetAdjustBtn,
-    prevBtn, nextBtn, recenterBtn, closeBtn, fullscreenBtn, setFrontBtn, resetFrontBtn, audioBtn, sideGallery;
-let infoStageEl, infoTakenEl, infoLocationEl;
+    prevBtn, nextBtn, recenterBtn, closeBtn, fullscreenBtn, audioBtn, sideGallery;
+let toggleLeftBtn, toggleRightBtn, viewerGridEl, centerPanelEl;
+// no header-based restore; use in-card chevrons and slim handles
+let infoStageEl, infoTakenEl, infoLocationEl, infoProjectTitleEl, infoStagesEl, infoMediaEl, infoDescEl, infoAudioEl;
 let mixUniform;
 let currentProject = null;
 let stages = [];
@@ -19,17 +21,38 @@ let stagePos = 0; // float 0..(stages.length-1)
 let fsOverlay;
 let fsIndicatorEl;
 let currentStageIndex = 0;
-let lastRelDelta = null; // { dTheta, dPhi } relative to stage front
+// relative view carry-over disabled (fronts removed)
 let toastHost;
 let audioEnabled = false;
+let _blockZoomHandlers = [];
+let loadingOverlayEl;
+let _progressLoaded = 0;
+let _progressTotal = 0;
 
-// Per-stage orientation & fronts (persisted)
+// Per-stage orientation (persisted)
 // Store angles instead of quaternions for OrbitControls
 // orients[index] -> [theta, phi]
-// fronts[index]  -> [theta, phi]
 let stageOrients = {};
-let stageFronts = {};
+// Per-stage adjustments (persisted)
+let exposureByStage = {};
+let gammaByStage = {};
 
+// Keep chevrons and aria/text in sync with collapse state
+function syncCollapseUI(){
+  const g = viewerGridEl || modalEl?.querySelector?.('.viewer-grid');
+  const leftOn = g?.classList?.contains('collapse-left');
+  const rightOn = g?.classList?.contains('collapse-right');
+  if(toggleLeftBtn){
+    toggleLeftBtn.setAttribute('aria-pressed', leftOn ? 'true':'false');
+    toggleLeftBtn.textContent = leftOn ? '›' : '‹';
+    toggleLeftBtn.title = leftOn ? 'Show Gallery' : 'Hide Gallery';
+  }
+  if(toggleRightBtn){
+    toggleRightBtn.setAttribute('aria-pressed', rightOn ? 'true':'false');
+    toggleRightBtn.textContent = rightOn ? '‹' : '›';
+    toggleRightBtn.title = rightOn ? 'Show Tools' : 'Hide Tools';
+  }
+}
 // Local persistence (per project)
 const STORE_PREFIX = 'p360:proj:';
 function storeKey(){ return `${STORE_PREFIX}${currentProject?.id || 'unknown'}`; }
@@ -53,7 +76,7 @@ function saveSettings(partial){
 }
 
 function ensureUIRefs(){
-  if(modalEl) return;
+  // Always (re)bind to current DOM; do not early-return
   modalEl = document.getElementById('viewerModal');
   container = document.getElementById('viewerCanvasWrap');
   titleEl = document.getElementById('viewerProjectTitle');
@@ -70,14 +93,124 @@ function ensureUIRefs(){
   recenterBtn = document.getElementById('recenterBtn');
   fullscreenBtn = document.getElementById('fullscreenBtn');
   closeBtn = document.getElementById('closeViewer');
-  setFrontBtn = document.getElementById('setFrontBtn');
-  resetFrontBtn = document.getElementById('resetFrontBtn');
   audioBtn = document.getElementById('audioBtn');
   sideGallery = document.getElementById('sideGallery');
   infoStageEl = document.getElementById('infoStage');
   infoTakenEl = document.getElementById('infoTaken');
   infoLocationEl = document.getElementById('infoLocation');
+  infoProjectTitleEl = document.getElementById('infoProjectTitle');
+  infoStagesEl = document.getElementById('infoStages');
+  infoMediaEl = document.getElementById('infoMedia');
+  infoDescEl = document.getElementById('infoDesc');
+  infoAudioEl = document.getElementById('infoAudio');
   toastHost = document.getElementById('toastHost');
+
+  // Landscape collapsible controls (header actions, not over image)
+  viewerGridEl = modalEl?.querySelector('.viewer-grid') || null;
+  centerPanelEl = modalEl?.querySelector('.center-panel') || null;
+  // Remove any legacy edge overlay toggles if present
+  try{ centerPanelEl?.querySelectorAll?.('.edge-toggle')?.forEach(el=> el.remove()); }catch{}
+  // Create in-card toggles
+  const leftPanel = modalEl?.querySelector('.left-panel');
+  const leftTitle = leftPanel?.querySelector('.panel-title');
+  if(leftTitle){
+    // Normalize header content: [spacer][label centered][chevron at right]
+    leftTitle.classList.add('chev-right');
+    // Ensure label + single spacer exist
+    let label = leftTitle.querySelector('.panel-label');
+    if(!label){
+      const text = (leftTitle.textContent || '').trim() || 'Gallery';
+      leftTitle.textContent = '';
+      const spacer = document.createElement('span');
+      spacer.className = 'panel-spacer';
+      leftTitle.appendChild(spacer);
+      label = document.createElement('span');
+      label.className = 'panel-label';
+      label.textContent = text;
+      leftTitle.appendChild(label);
+    }else{
+      // If two spacers exist from previous runs, keep only one
+      const spacers = leftTitle.querySelectorAll('.panel-spacer');
+      if(spacers.length > 1){ spacers.forEach((s,i)=>{ if(i>0) s.remove(); }); }
+      if(spacers.length === 0){ const sp = document.createElement('span'); sp.className='panel-spacer'; leftTitle.insertBefore(sp, label); }
+    }
+    toggleLeftBtn = leftTitle.querySelector('#toggleLeftBtn');
+    if(!toggleLeftBtn){
+      toggleLeftBtn = document.createElement('button');
+      toggleLeftBtn.id = 'toggleLeftBtn';
+      toggleLeftBtn.type = 'button';
+      toggleLeftBtn.className = 'btn ghost toggle-btn';
+      toggleLeftBtn.setAttribute('aria-pressed','false');
+      leftTitle.appendChild(toggleLeftBtn);
+    }
+  }
+
+  const rightRail = modalEl?.querySelector('.right-rail');
+  // Remove legacy right-toggle card if it exists
+  try{ rightRail?.querySelectorAll?.('.right-toggle')?.forEach(el=> el.remove()); }catch{}
+  // Build a Tools header card and a tools-content container; move existing panels inside
+  if(rightRail){
+    let toolsHeader = rightRail.querySelector('.right-tools');
+    if(!toolsHeader){
+      toolsHeader = document.createElement('aside');
+      toolsHeader.className = 'panel card-panel right-tools';
+      const h = document.createElement('h3');
+      h.className = 'panel-title chev-left';
+      // label + spacer (chevron inserted first below)
+      const label = document.createElement('span'); label.className = 'panel-label'; label.textContent = 'Tools';
+      const spacer = document.createElement('span'); spacer.className = 'panel-spacer';
+      h.appendChild(label);
+      h.appendChild(spacer);
+      toolsHeader.appendChild(h);
+      rightRail.insertBefore(toolsHeader, rightRail.firstChild);
+    }else{
+      const h = toolsHeader.querySelector('.panel-title');
+      if(h) h.classList.add('chev-left');
+      if(h && !h.querySelector('.panel-label')){
+        const label = document.createElement('span'); label.className='panel-label'; label.textContent='Tools';
+        const spacer = document.createElement('span'); spacer.className='panel-spacer';
+        h.appendChild(label); h.appendChild(spacer);
+      }
+    }
+    // Insert chevron button
+    const h2 = toolsHeader.querySelector('.panel-title');
+    toggleRightBtn = toolsHeader.querySelector('#toggleRightBtn');
+    if(!toggleRightBtn){
+      toggleRightBtn = document.createElement('button');
+      toggleRightBtn.id = 'toggleRightBtn';
+      toggleRightBtn.type = 'button';
+      toggleRightBtn.className = 'btn ghost toggle-btn';
+      toggleRightBtn.setAttribute('aria-pressed','false');
+      h2?.insertBefore(toggleRightBtn, h2.firstChild);
+    }
+    // Create tools-content card and move panels inside
+    let toolsContent = rightRail.querySelector('.tools-content');
+    if(!toolsContent){
+      toolsContent = document.createElement('aside');
+      toolsContent.className = 'panel card-panel tools-content';
+      // move existing info/actions/adjustments cards into tools-content
+      const info = rightRail.querySelector('.right-info');
+      const actions = rightRail.querySelector('.right-actions');
+      const adjust = rightRail.querySelector('.right-panel');
+      if(info) toolsContent.appendChild(info);
+      if(actions) toolsContent.appendChild(actions);
+      if(adjust) toolsContent.appendChild(adjust);
+      rightRail.appendChild(toolsContent);
+    }
+  }
+
+  // No header restore buttons per design
+
+  // Ensure a lightweight loading overlay exists over the canvas area
+  try{
+    if(container && !loadingOverlayEl){
+      loadingOverlayEl = document.createElement('div');
+      loadingOverlayEl.className = 'loading-overlay';
+      loadingOverlayEl.innerHTML = '<div class="spinner"></div><div class="loading-text">Loading…</div>';
+      container.appendChild(loadingOverlayEl);
+      loadingOverlayEl.style.display = 'none';
+    }
+  }catch{}
 
   if(!modalEl || !container) throw new Error('Viewer UI elements not found');
 
@@ -91,11 +224,18 @@ function ensureUIRefs(){
   exposureRange?.addEventListener('input', (e)=> setExposure(parseFloat(e.target.value)) );
   gammaRange?.addEventListener('input', (e)=> setGamma(parseFloat(e.target.value)) );
   autoAdjustBtn?.addEventListener('click', ()=> autoAdjust());
-  resetAdjustBtn?.addEventListener('click', ()=> { setExposure(1.0); setGamma(1.0); });
+  resetAdjustBtn?.addEventListener('click', ()=> { setExposure(1.0); setGamma(1.1); });
   recenterBtn?.addEventListener('click', ()=> recenterToStageFront());
-  setFrontBtn?.addEventListener('click', ()=> setCurrentStageFront());
-  resetFrontBtn?.addEventListener('click', ()=> resetCurrentStageFront());
   audioBtn?.addEventListener('click', ()=> setAudioEnabled(!audioEnabled));
+  // Reflect audio state styling
+  if(audioBtn){ audioBtn.classList.toggle('active', !!audioEnabled); }
+
+  // Collapse/expand handlers
+  const grid = ()=> (viewerGridEl || modalEl?.querySelector('.viewer-grid'));
+  toggleLeftBtn?.addEventListener('click', ()=>{ const g = grid(); if(!g) return; g.classList.toggle('collapse-left'); syncCollapseUI(); setTimeout(onResize,0); });
+  toggleRightBtn?.addEventListener('click', ()=>{ const g = grid(); if(!g) return; g.classList.toggle('collapse-right'); syncCollapseUI(); setTimeout(onResize,0); });
+  // Initial sync now that buttons exist
+  syncCollapseUI();
 }
 
 // Toasts
@@ -115,7 +255,10 @@ function showToast(message, type = 'info', timeoutMs = 2600){
 
 function setAudioEnabled(flag){
   audioEnabled = !!flag;
-  if(audioBtn){ audioBtn.textContent = audioEnabled ? 'Audio On' : 'Audio Off'; }
+  if(audioBtn){
+    audioBtn.textContent = audioEnabled ? 'Audio On' : 'Audio Off';
+    audioBtn.classList.toggle('active', audioEnabled);
+  }
   // update overlay button label if present
   if(fsOverlay){
     const ab = fsOverlay.querySelector('button[data-action="audio"]');
@@ -124,6 +267,8 @@ function setAudioEnabled(flag){
   // Apply to current stage
   applyAudioForCurrent();
   showToast(audioEnabled ? 'Audio enabled' : 'Audio muted', 'info');
+  // Update info panel status if visible
+  try{ updateInfoPanel(); }catch{}
 }
 
 function applyAudioForCurrent(){
@@ -156,22 +301,13 @@ function setStagePos(v, persist = true){
   const newIndex = Math.floor(targetPos);
   const changedIndex = (newIndex !== currentStageIndex);
 
-  // Compute relative view delta (angles) to current stage's front before switching
-  if(changedIndex && camera){
-    const oldFront = stageFronts[currentStageIndex];
-    if(oldFront){
-      const ang = getAngles();
-      const dTheta = normAngle(ang.theta - oldFront[0]);
-      const dPhi = ang.phi - oldFront[1];
-      lastRelDelta = { dTheta, dPhi };
-    } else lastRelDelta = null;
-  }
+  // Compute relative view delta disabled (fronts removed)
 
   stagePos = targetPos;
   currentStageIndex = newIndex;
   const frac = stagePos - newIndex;
-  const texA = stageTextures[newIndex];
-  const texB = stageTextures[Math.min(newIndex+1, stageTextures.length-1)] || texA;
+  const texA = getTextureAt(newIndex);
+  const texB = getTextureAt(Math.min(newIndex+1, stageTextures.length-1)) || texA;
   if(material){
     material.uniforms.map1.value = texA;
     material.uniforms.map2.value = texB;
@@ -182,16 +318,22 @@ function setStagePos(v, persist = true){
   // Update overlay indicator if visible
   if(fsOverlay && fsOverlay.style.display !== 'none') updateFsIndicator();
   updateInfoPanel();
+  // Keep current view on stage change; no auto-rotate
   if(changedIndex){
-    // If both stages have a defined front and we have a delta, carry view over (angles)
-    const newFront = stageFronts[newIndex];
-    if(lastRelDelta && newFront){
-      setAngles(normAngle(newFront[0] + lastRelDelta.dTheta), newFront[1] + lastRelDelta.dPhi);
-    } else {
-      // Do not auto-rotate when fronts are not set; keep current view.
-    }
+    // Load per-stage adjustments (and auto if missing)
+    applyAdjustmentsForStage(newIndex, true);
+    // Make sure recenter has a baseline orientation for this stage
+    ensureStageOrient(newIndex);
   }
   playStageMedia(currentStageIndex);
+}
+
+function getTextureAt(i){
+  if(!stageTextures || !stageTextures.length) return null;
+  if(stageTextures[i]) return stageTextures[i];
+  for(let k=i; k>=0; k--){ if(stageTextures[k]) return stageTextures[k]; }
+  for(let k=i; k<stageTextures.length; k++){ if(stageTextures[k]) return stageTextures[k]; }
+  return stageTextures.find(Boolean) || null;
 }
 
 function playStageMedia(index){
@@ -213,7 +355,8 @@ function playStageMedia(index){
 }
 
 function nudgeStage(dir){
-  const i = Math.round(stagePos) + dir;
+  // Use the committed stage index to avoid skipping when slider is between ticks
+  const i = currentStageIndex + dir;
   setStagePos(i);
 }
 
@@ -315,7 +458,7 @@ function showFsOverlay(show){
     fsOverlay.innerHTML = `
       <div class="fs-exit">
         <button class="btn ghost" data-action="audio">Audio Off</button>
-        <button class="btn ghost" data-action="exit">Exit</button>
+        <button class="btn exit-btn" data-action="exit">Exit Full Screen</button>
       </div>
       <div class="fs-nav">
         <button class="btn big" data-action="prev">Prev</button>
@@ -356,6 +499,31 @@ function updateInfoPanel(){
   const i = Math.floor(stagePos);
   const stage = stages[i];
   if(infoStageEl) infoStageEl.textContent = stage?.label || `Stage ${i+1}`;
+  if(infoProjectTitleEl) infoProjectTitleEl.textContent = currentProject?.title || '-';
+  if(infoStagesEl) infoStagesEl.textContent = `${stages.length}`;
+  if(infoMediaEl){
+    const imgs = stages.filter(s=> /\.jpg(\?|$)/i.test(s.url)).length;
+    const vids = stages.filter(s=> /\.(mp4|webm|ogg)(\?|$)/i.test(s.url)).length;
+    const parts = [];
+    if(imgs) parts.push(`${imgs} image${imgs>1?'s':''}`);
+    if(vids) parts.push(`${vids} video${vids>1?'s':''}`);
+    infoMediaEl.textContent = parts.join(' • ') || '-';
+  }
+  if(infoDescEl){
+    const desc = currentProject?.meta?.description || currentProject?.description || '';
+    infoDescEl.textContent = desc || 'No description available.';
+  }
+  // Audio availability per stage
+  if(infoAudioEl){
+    const isVideo = /\.(mp4|webm|ogg)(\?|$)/i.test(stage?.url||'');
+    const status = isVideo ? (audioEnabled ? 'Available • On' : 'Available • Off') : 'Not available';
+    infoAudioEl.textContent = status;
+  }
+  // Toggle subtle attention pulse on Audio button when stage has audio but is muted
+  try{
+    const isVideo = /\.(mp4|webm|ogg)(\?|$)/i.test(stage?.url||'');
+    if(audioBtn){ audioBtn.classList.toggle('audio-attn', !!isVideo && !audioEnabled); }
+  }catch{}
   const url = stage?.url;
   if(!url){
     if(infoTakenEl) infoTakenEl.textContent = '—';
@@ -375,7 +543,7 @@ function updateInfoPanel(){
     return;
   }
   // Parse EXIF for date/time and GPS; fall back to HTTP Last-Modified
-  fetch(url + (url.includes('?')?'&':'?') + 'cb=' + Date.now())
+  fetch(url, { cache: 'force-cache' })
     .then(async (r)=>{
       const lastModified = r.headers.get('last-modified');
       const buf = await r.arrayBuffer();
@@ -528,14 +696,47 @@ function setExposure(v, persist = true){
   if(!material) return;
   material.uniforms.exposure.value = v;
   if(exposureRange) exposureRange.value = String(v);
-  if(persist) saveSettings({ exposure: v });
+  if(persist){
+    exposureByStage[currentStageIndex] = v;
+    saveSettings({ exposureByStage: { [currentStageIndex]: v } });
+  }
 }
 
 function setGamma(v, persist = true){
   if(!material) return;
   material.uniforms.gamma.value = v;
   if(gammaRange) gammaRange.value = String(v);
-  if(persist) saveSettings({ gamma: v });
+  if(persist){
+    gammaByStage[currentStageIndex] = v;
+    saveSettings({ gammaByStage: { [currentStageIndex]: v } });
+  }
+}
+
+// Apply saved (or default/auto) adjustments for a given stage
+function applyAdjustmentsForStage(index, allowAuto = true){
+  const eSaved = (exposureByStage && typeof exposureByStage[index] === 'number') ? exposureByStage[index] : null;
+  const gSaved = (gammaByStage && typeof gammaByStage[index] === 'number') ? gammaByStage[index] : null;
+  const e = eSaved ?? 1.0;
+  const g = gSaved ?? 1.3;
+  // Apply without persisting
+  setExposure(e, false);
+  setGamma(g, false);
+  if(allowAuto && (eSaved == null || gSaved == null)){
+    const i = index;
+    const url = (currentProject?.stages?.[i]?.url) || (currentProject?.stages?.[0]?.url);
+    if(url){
+      analyzeImage(url).then(({ exposure, gamma })=>{
+        if(eSaved == null){
+          if(currentStageIndex === i) setExposure(exposure);
+          else { exposureByStage[i] = exposure; saveSettings({ exposureByStage: { [i]: exposure } }); }
+        }
+        if(gSaved == null){
+          if(currentStageIndex === i) setGamma(gamma);
+          else { gammaByStage[i] = gamma; saveSettings({ gammaByStage: { [i]: gamma } }); }
+        }
+      }).catch(()=>{});
+    }
+  }
 }
 
 function initRenderer(){
@@ -600,48 +801,32 @@ function applySavedOrientationForStage(index){
   if(stageOrients && stageOrients[index]){
     const a = stageOrients[index];
     setAngles(a[0], a[1]);
-    return;
-  }
-  if(stageFronts && stageFronts[index]){
-    const a = stageFronts[index];
-    setAngles(a[0], a[1]);
+    // Make this the reset baseline so Recenter works reliably
+    try{ controls?.saveState?.(); }catch{}
     return;
   }
 }
 
-function setCurrentStageFront(){
+// Ensure there is a baseline orientation saved for a stage
+function ensureStageOrient(index){
   if(!controls) return;
-  const ang = getAngles();
-  stageFronts[currentStageIndex] = [ang.theta, ang.phi];
-  saveSettings({ fronts: { [currentStageIndex]: stageFronts[currentStageIndex] } });
-  if(statusEl) statusEl.textContent = 'Front saved for this stage';
-  showToast('Front saved for this stage', 'success');
+  if(!stageOrients) stageOrients = {};
+  if(typeof stageOrients[index] === 'undefined'){
+    const ang = getAngles();
+    stageOrients[index] = [ang.theta, ang.phi];
+    saveSettings({ orients: { [index]: stageOrients[index] } });
+    // Also set the current state as the reset baseline
+    try{ controls?.saveState?.(); }catch{}
+  }
 }
 
 function recenterToStageFront(){
-  if(stageFronts[currentStageIndex]){
-    const a = stageFronts[currentStageIndex];
-    setAngles(a[0], a[1]);
-  } else if(stageOrients[currentStageIndex]){
-    const a = stageOrients[currentStageIndex];
-    setAngles(a[0], a[1]);
-  } else {
-    controls?.reset?.();
-  }
-}
-
-function resetCurrentStageFront(){
-  if(stageFronts[currentStageIndex]){
-    delete stageFronts[currentStageIndex];
-    // Persist full map (replace), not merged
-    try{
-      const s = loadSettings();
-      s.fronts = { ...stageFronts };
-      localStorage.setItem(storeKey(), JSON.stringify(s));
-    }catch{}
-    if(statusEl) statusEl.textContent = 'Front reset for this stage';
-    showToast('Front reset for this stage', 'info');
-  }
+  // Prefer the controls reset baseline for smooth, reliable recentering
+  if(controls?.reset){ controls.reset(); return; }
+  // Fallback: use saved orientation or sensible default
+  const a = stageOrients?.[currentStageIndex];
+  if(a){ setAngles(a[0], a[1]); }
+  else { setAngles(0, Math.PI/2); ensureStageOrient(currentStageIndex); }
 }
 
 function onResize(){
@@ -712,6 +897,7 @@ function EquirectBlendMaterial(texA, texB){
         b = srgb_to_linear(b);
         vec3 col = mix(a, b, clamp(mixAmount, 0.0, 1.0));
         col *= exposure;
+        // Apply display gamma so higher gamma brightens (consistent with Exposure)
         col = pow(max(col, 1e-6), vec3(1.0 / max(gamma, 1e-6)));
         col = linear_to_srgb(col);
         gl_FragColor = vec4(col, 1.0);
@@ -761,9 +947,9 @@ async function analyzeImage(url){
     sum += Y;
   }
   const mean = sum / (w*h);
-  const target = 0.22; // middle gray target in linear space
+  const target = 0.32; // even brighter middle gray target in linear space
   const exposure = Math.min(2.0, Math.max(0.5, target / Math.max(1e-6, mean)));
-  const gamma = 1.0; // keep neutral for now; manual control via slider
+  const gamma = 1.2; // brighter default gamma
   return { exposure, gamma };
 }
 
@@ -773,11 +959,13 @@ function loadImage(url){
     img.crossOrigin = 'anonymous';
     img.onload = ()=> resolve(img);
     img.onerror = reject;
-    img.src = url + (url.includes('?') ? '&' : '?') + 'cachebust=' + Date.now();
+    // Allow caching so subsequent openings are instant
+    img.src = url;
   });
 }
 
 async function loadStages(urls){
+  // Retained for compatibility (full preloading), but buildScene uses progressive load
   const loader = new THREE.TextureLoader();
   const loadTex = (url)=> new Promise((res,rej)=> loader.load(url, (t)=> res(t), undefined, rej));
   const texs = [];
@@ -792,7 +980,6 @@ async function loadStages(urls){
         video.muted = true;
         video.playsInline = true;
         video.preload = 'auto';
-        // Do not auto play here; will be started when stage becomes active
         const tex = new THREE.VideoTexture(video);
         tex.colorSpace = THREE.SRGBColorSpace;
         tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
@@ -812,9 +999,67 @@ async function loadStages(urls){
       stageVideos.push(stageVideos[stageVideos.length-1] || null);
     }
   }
-  // replace any nulls with last valid
   for(let i=0;i<texs.length;i++) if(!texs[i]) { texs[i] = texs[i-1] || texs.find(Boolean); stageVideos[i] = stageVideos[i-1] || null; }
   return texs;
+}
+
+function showLoadingOverlay(show, text){
+  try{
+    if(loadingOverlayEl){
+      // ensure overlay is top-most child over canvas
+      if(container && loadingOverlayEl.parentNode !== container){ container.appendChild(loadingOverlayEl); }
+      else if(container && container.lastElementChild !== loadingOverlayEl){ container.appendChild(loadingOverlayEl); }
+      loadingOverlayEl.style.display = show ? 'flex' : 'none';
+      const t = loadingOverlayEl.querySelector('.loading-text');
+      if(t && text) t.textContent = text;
+    }
+  }catch{}
+}
+
+function updateProgress(){
+  if(!_progressTotal) return;
+  const msg = _progressLoaded >= _progressTotal ? 'Ready' : `Loading ${_progressLoaded}/${_progressTotal}…`;
+  if(statusEl) statusEl.textContent = msg;
+  if(loadingOverlayEl && loadingOverlayEl.style.display !== 'none'){
+    const t = loadingOverlayEl.querySelector('.loading-text');
+    if(t) t.textContent = msg;
+  }
+}
+
+function loadOneStage(index, url){
+  return new Promise((resolve)=>{
+    const finish = ()=>{ _progressLoaded++; updateProgress(); resolve(); };
+    try{
+      if(/\.(mp4|webm|ogg)(\?|$)/i.test(url)){
+        const video = document.createElement('video');
+        video.src = url;
+        video.crossOrigin = 'anonymous';
+        video.loop = true;
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = 'auto';
+        const tex = new THREE.VideoTexture(video);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+        tex.needsUpdate = true;
+        stageVideos[index] = video;
+        stageTextures[index] = tex;
+        finish();
+      } else {
+        const loader = new THREE.TextureLoader();
+        loader.load(url, (t)=>{
+          try{
+            t.colorSpace = THREE.SRGBColorSpace;
+            t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+            stageTextures[index] = t;
+          }catch{}
+          finish();
+        }, undefined, ()=>{ finish(); });
+      }
+    }catch{
+      finish();
+    }
+  });
 }
 
 function populateSideGallery(){
@@ -825,6 +1070,7 @@ function populateSideGallery(){
     img.src = s.url;
     img.alt = s.label || `Stage ${idx+1}`;
     img.className = 'thumb';
+    try{ img.loading = 'lazy'; img.decoding = 'async'; }catch{}
     img.addEventListener('click', ()=> setStagePos(idx));
     sideGallery.appendChild(img);
   });
@@ -853,7 +1099,15 @@ async function buildScene({ title, stages: stageDefs }){
     if(statusEl) statusEl.textContent = 'No images found';
     return;
   }
-  stageTextures = await loadStages(stages.map(s=> s.url));
+  // Progressive load: first show stage 0 ASAP, then fill the rest
+  stageTextures = new Array(stages.length).fill(null);
+  stageVideos = new Array(stages.length).fill(null);
+  _progressLoaded = 0;
+  _progressTotal = stages.length;
+
+  const urls = stages.map(s=> s.url);
+  // Load first stage first for immediate display
+  await loadOneStage(0, urls[0]);
   if(timelineRange){
     timelineRange.min = '0';
     timelineRange.max = String(Math.max(0, stages.length-1));
@@ -863,8 +1117,8 @@ async function buildScene({ title, stages: stageDefs }){
   updateTimelineTicks(stages.length);
   populateSideGallery();
 
-  const texA = stageTextures[0];
-  const texB = stageTextures[Math.min(1, stageTextures.length-1)] || texA;
+  const texA = getTextureAt(0);
+  const texB = getTextureAt(Math.min(1, stageTextures.length-1)) || texA;
   material = EquirectBlendMaterial(texA, texB);
   mixUniform = material.uniforms.mixAmount;
 
@@ -872,21 +1126,30 @@ async function buildScene({ title, stages: stageDefs }){
   sphere = new THREE.Mesh(geom, material);
   scene.add(sphere);
 
-  if(statusEl) statusEl.textContent = 'Ready';
+  // Hide overlay once first frame is ready, continue background loading
+  showLoadingOverlay(false);
+  updateProgress();
+  if(_progressLoaded >= _progressTotal){ if(statusEl) statusEl.textContent = 'Ready'; }
   if(titleEl) titleEl.textContent = title || 'Project';
   // Initialize defaults without persisting over saved settings
   setStagePos(0.0, false);
-  setExposure(1.0, false);
-  setGamma(1.0, false);
   updateInfoPanel();
-  // Restore saved per-stage orientations/fronts
+  // Restore saved per-stage orientations & adjustments
   const saved = loadSettings();
   stageOrients = saved.orients || {};
-  stageFronts = saved.fronts || {};
+  exposureByStage = saved.exposureByStage || {};
+  gammaByStage = saved.gammaByStage || {};
   applySavedOrientationForStage(0);
+  ensureStageOrient(0);
+  applyAdjustmentsForStage(0, true);
   // start initial video(s)
   playStageMedia(0);
   animate();
+
+  // Kick off background loading for remaining stages (including stage 1)
+  const tasks = [];
+  for(let i=1;i<urls.length;i++) tasks.push(loadOneStage(i, urls[i]));
+  Promise.all(tasks).then(()=>{ updateProgress(); if(statusEl) statusEl.textContent = 'Ready'; playStageMedia(currentStageIndex); });
 }
 
 export async function openViewer(project){
@@ -896,12 +1159,33 @@ export async function openViewer(project){
 
   // Show modal
   modalEl.setAttribute('aria-hidden', 'false');
+  // Reset collapsed state on open (landscape/desktop)
+  const g = viewerGridEl || modalEl.querySelector('.viewer-grid');
+  g?.classList.remove('collapse-left','collapse-right');
+  // Ensure chevrons show immediately
+  syncCollapseUI();
+  // Update toggle state after DOM settles
+  setTimeout(()=>{ syncCollapseUI(); },0);
   document.body.classList.add('viewer-open');
   if(statusEl) statusEl.textContent = 'Loading…';
   if(titleEl) titleEl.textContent = project.title || 'Project';
 
   // Ensure renderer exists now that container is visible
   initRenderer();
+  // Show overlay immediately while first texture prepares
+  showLoadingOverlay(true, 'Loading…');
+  // Block browser zoom gestures while viewer is open (mobile/tablet)
+  try{
+    const prevent = (e)=> { e.preventDefault(); };
+    const onTouchEnd = (()=>{ let lt=0; return (e)=>{ const now=Date.now(); if(now-lt<300){ e.preventDefault(); } lt=now; }; })();
+    document.addEventListener('gesturestart', prevent, { passive:false });
+    document.addEventListener('gesturechange', prevent, { passive:false });
+    document.addEventListener('gestureend', prevent, { passive:false });
+    modalEl.addEventListener('touchend', onTouchEnd, { passive:false });
+    _blockZoomHandlers = [
+      ['gesturestart', prevent],['gesturechange', prevent],['gestureend', prevent],['touchend', onTouchEnd]
+    ];
+  }catch{}
   // Keyboard shortcuts for navigation in fullscreen/VR
   const onKey = (e)=>{
     if(e.key === 'ArrowRight') nudgeStage(+1);
@@ -928,15 +1212,14 @@ export async function openViewer(project){
     await buildScene(project);
     // After camera is ready, force a resize to update aspect
     onResize();
-    // Apply saved adjustments and position if present
+    // Apply saved adjustments and position if present (per stage)
     const saved = loadSettings();
-    if(typeof saved.stagePos === 'number') setStagePos(saved.stagePos, false);
-    if(typeof saved.exposure === 'number') setExposure(saved.exposure, false);
-    if(typeof saved.gamma === 'number') setGamma(saved.gamma, false);
-    // Load saved orientation/front maps
+    // Load saved maps
     stageOrients = saved.orients || {};
-    stageFronts = saved.fronts || {};
+    exposureByStage = saved.exposureByStage || {};
+    gammaByStage = saved.gammaByStage || {};
     applySavedOrientationForStage(currentStageIndex);
+    applyAdjustmentsForStage(currentStageIndex, true);
   }catch(err){
     console.error(err);
     if(statusEl) statusEl.textContent = 'Failed to load images';
@@ -953,4 +1236,12 @@ export function closeViewer(){
   // pause any videos
   if(stageVideos && stageVideos.length){ for(const v of stageVideos){ try{ v && v.pause(); }catch{} } }
   // leave canvas & VR button mounted for faster reopen
+  // Remove zoom blockers
+  try{
+    for(const [ev, fn] of _blockZoomHandlers){
+      if(ev.startsWith('gesture')) document.removeEventListener(ev, fn, { passive:false });
+      else if(ev==='touchend') modalEl?.removeEventListener(ev, fn, { passive:false });
+    }
+    _blockZoomHandlers = [];
+  }catch{}
 }

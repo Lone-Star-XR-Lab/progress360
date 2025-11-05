@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
   <title>Progress360</title>
   <link rel="stylesheet" href="./styles.css" />
   <!-- Map bare specifiers used by three.js examples to CDN URLs -->
@@ -22,13 +22,13 @@
 <div class="logo-ring" aria-hidden="true"></div>
 <h1>Progress<span class="accent">360</span></h1>
 </div>
-<nav class="tagline">Before • After • Beyond</nav>
+<nav class="tagline">Before &bull; After &bull; 360&deg;</nav>
 </header>
 
 
 <main>
 <section class="intro">
-<p>Experience campus transformations in immersive 360°. Select a project to view its <strong>before</strong> and <strong>after</strong> panoramas on web, phone, or VR headsets via WebXR.</p>
+<p>Explore spaces and projects in immersive 360&deg;. Select a project to view <strong>before</strong> and <strong>after</strong> panoramas on the web, your phone, or in VR (WebXR supported).</p>
 </section>
 
 
@@ -66,9 +66,18 @@
     <aside class="panel card-panel right-info">
       <h3 class="panel-title">Info</h3>
       <div class="info-panel">
-        <div class="info-row"><span class="k">Stage</span><span id="infoStage" class="v">—</span></div>
-        <div class="info-row"><span class="k">Taken</span><span id="infoTaken" class="v">—</span></div>
-        <div class="info-row"><span class="k">Location</span><span id="infoLocation" class="v">—</span></div>
+        <div class="info-row"><span class="k">Project</span><span id="infoProjectTitle" class="v">-</span></div>
+        <div class="info-block">
+          <div class="info-block-title">About</div>
+          <div id="infoDesc" class="info-desc">No description available.</div>
+        </div>
+        <hr class="info-sep" />
+        <div class="info-row"><span class="k">Stage</span><span id="infoStage" class="v">-</span></div>
+        <div class="info-row"><span class="k">Taken</span><span id="infoTaken" class="v">-</span></div>
+        <div class="info-row"><span class="k">Location</span><span id="infoLocation" class="v">-</span></div>
+        <div class="info-row"><span class="k">Stages</span><span id="infoStages" class="v">-</span></div>
+        <div class="info-row"><span class="k">Media</span><span id="infoMedia" class="v">-</span></div>
+        <div class="info-row"><span class="k">Audio</span><span id="infoAudio" class="v">-</span></div>
       </div>
     </aside>
 
@@ -78,8 +87,6 @@
         <div class="control-group row">
           <button id="fullscreenBtn" class="btn ghost">Full Screen</button>
           <button id="recenterBtn" class="btn ghost">Recenter View</button>
-          <button id="setFrontBtn" class="btn ghost">Set Front</button>
-          <button id="resetFrontBtn" class="btn ghost">Reset Front</button>
           <button id="audioBtn" class="btn ghost">Audio Off</button>
         </div>
       </div>
@@ -96,7 +103,7 @@
         <div class="control-group">
           <label for="gammaRange">Gamma</label>
           <input id="gammaRange" type="range" min="0.5" max="2" step="0.01" value="1" />
-          <div class="legend"><span>Lower = brighter</span><span>Higher = darker</span></div>
+          <div class="legend"><span>Darker</span><span>Brighter</span></div>
         </div>
         <div class="control-group row">
           <button id="autoAdjustBtn" class="btn">Auto Adjust</button>
@@ -130,5 +137,12 @@
 
 
 <script type="module" src="./main.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function(){
+      navigator.serviceWorker.register('./sw.js').catch(function(){ /* ignore */ });
+    });
+  }
+</script>
 </body>
 </html>

@@ -1,12 +1,56 @@
 {
   "projects": [
     {
+      "id": "commons",
+      "title": "commons",
+      "folder": "assets/lone-star-college-tomball-commons",
+      "slug": "commons",
+      "thumb": "assets/lone-star-college-tomball-commons/000-commons.jpg",
+      "meta": {
+        "location": "Main Office",
+        "phase": "Completed",
+        "updated": "2025-10-20",
+        "description": "Work-from-home office refresh with improved lighting, cable management, and a multi‑monitor ergonomic setup."
+      }
+    },
+    {
+      "id": "garden",
+      "title": "garden",
+      "folder": "assets/lone-star-college-tomball-garden",
+      "slug": "garden",
+      "thumb": "assets/lone-star-college-tomball-garden/000-garden.jpg",
+      "meta": {
+        "location": "Main Office",
+        "phase": "Completed",
+        "updated": "2025-10-20",
+        "description": "Work-from-home office refresh with improved lighting, cable management, and a multi‑monitor ergonomic setup."
+      }
+    },
+    {
+      "id": "ric",
+      "title": "ric",
+      "folder": "assets/lone-star-college-tomball-ric",
+      "slug": "ric",
+      "thumb": "assets/lone-star-college-tomball-ric/000-ric.jpg",
+      "meta": {
+        "location": "Main Office",
+        "phase": "Completed",
+        "updated": "2025-10-20",
+        "description": "Work-from-home office refresh with improved lighting, cable management, and a multi‑monitor ergonomic setup."
+      }
+    },
+    {
       "id": "office",
       "title": "Office",
       "folder": "assets/office",
       "slug": "office",
       "thumb": "assets/office/000-office.jpg",
-      "meta": { "location": "Main Office" }
+      "meta": {
+        "location": "Main Office",
+        "phase": "Completed",
+        "updated": "2025-10-20",
+        "description": "Work-from-home office refresh with improved lighting, cable management, and a multi‑monitor ergonomic setup."
+      }
     },
     {
       "id": "kitchen",
@@ -14,15 +58,12 @@
       "folder": "assets/kitchen",
       "slug": "kitchen",
       "thumb": "assets/kitchen/000-kitchen.jpg",
-      "meta": { "location": "Kitchen" }
-    },
-    {
-      "id": "bedroom",
-      "title": "Bedroom",
-      "folder": "assets/bedroom",
-      "slug": "bedroom",
-      "thumb": "assets/bedroom/000-bedroom.jpg",
-      "meta": { "location": "Bedroom" }
+      "meta": {
+        "location": "Kitchen",
+        "phase": "In Progress",
+        "updated": "2025-09-28",
+        "description": "Kitchen modernization highlighting new cabinetry, lighting, and expanded prep space."
+      }
     },
     {
       "id": "xr-lab",
@@ -30,7 +71,12 @@
       "folder": "assets/xr-lab",
       "slug": "xr-lab",
       "thumb": "assets/xr-lab/000-xr-lab.jpg",
-      "meta": { "location": "XR Lab" }
+      "meta": {
+        "location": "XR Lab",
+        "phase": "Planning",
+        "updated": "2025-10-05",
+        "description": "Spatial computing classroom with dedicated VR/AR workstations and flexible collaboration areas."
+      }
     },
     {
       "id": "deck",
@@ -38,7 +84,12 @@
       "folder": "assets/deck",
       "slug": "deck",
       "thumb": "assets/deck/000-deck.jpg",
-      "meta": { "location": "Deck" }
+      "meta": {
+        "location": "Deck",
+        "phase": "Completed",
+        "updated": "2025-10-26",
+        "description": "Outdoor deck refresh with new lighting and seating optimized for evening gatherings."
+      }
     },
     {
       "id": "backyard",
@@ -46,7 +97,12 @@
       "folder": "assets/backyard",
       "slug": "backyard",
       "thumb": "assets/backyard/000-backyard.jpg",
-      "meta": { "location": "backyard" }
+      "meta": {
+        "location": "Backyard",
+        "phase": "Completed",
+        "updated": "2025-08-30",
+        "description": "Landscaping and patio updates to create a cozy, low‑maintenance outdoor space."
+      }
     }
   ]
 }

@@ -1,0 +1,14 @@
+*** Begin Patch
+*** Update File: viewer.js
+@@
+-    const ab = fsOverlay.querySelector('button[data-action="audio"]');
+-    if(ab) ab.textContent = audioEnabled ? 'Audio On' : 'Audio Off';
++    const ab = fsOverlay.querySelector('button[data-action="audio"]');
++    if(ab){
++      ab.textContent = audioEnabled ? 'Audio On' : 'Audio Off';
++      const i = Math.floor(stagePos);
++      const url = stages[i]?.url || '';
++      const isVideo = /\.(mp4|webm|ogg)(\?|$)/i.test(url);
++      ab.style.display = isVideo ? '' : 'none';
++    }
+*** End Patch
