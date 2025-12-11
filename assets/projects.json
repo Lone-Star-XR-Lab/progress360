@@ -2,7 +2,7 @@
   "projects": [
     {
       "id": "commons",
-      "title": "commons",
+      "title": "Commons",
       "folder": "assets/lone-star-college-tomball-commons",
       "slug": "commons",
       "thumb": "assets/lone-star-college-tomball-commons/000-commons.jpg",
@@ -10,12 +10,18 @@
         "location": "Main Office",
         "phase": "Completed",
         "updated": "2025-10-20",
-        "description": "Work-from-home office refresh with improved lighting, cable management, and a multi‑monitor ergonomic setup."
-      }
+        "description": "The central gathering area for the college."
+      },
+      "campus": {
+        "campus": "Lone Star College – Tomball",
+        "building": "Commons",
+        "room": ""
+      },
+      "tags": ["student-life", "public-space"]
     },
     {
       "id": "garden",
-      "title": "garden",
+      "title": "Garden",
       "folder": "assets/lone-star-college-tomball-garden",
       "slug": "garden",
       "thumb": "assets/lone-star-college-tomball-garden/000-garden.jpg",
@@ -23,12 +29,18 @@
         "location": "Main Office",
         "phase": "Completed",
         "updated": "2025-10-20",
-        "description": "Work-from-home office refresh with improved lighting, cable management, and a multi‑monitor ergonomic setup."
-      }
+        "description": "A student garden for hands-on learning about plants and gardening."
+      },
+      "campus": {
+        "campus": "Lone Star College – Tomball",
+        "building": "Outdoor Learning",
+        "room": "Garden"
+      },
+      "tags": ["outdoor", "sustainability"]
     },
     {
       "id": "ric",
-      "title": "ric",
+      "title": "Research and Innovation Center",
       "folder": "assets/lone-star-college-tomball-ric",
       "slug": "ric",
       "thumb": "assets/lone-star-college-tomball-ric/000-ric.jpg",
@@ -36,8 +48,71 @@
         "location": "Main Office",
         "phase": "Completed",
         "updated": "2025-10-20",
-        "description": "Work-from-home office refresh with improved lighting, cable management, and a multi‑monitor ergonomic setup."
-      }
+        "description": "The Research and Innovation Center explores and implements new ideas, initiatives, and interventions that foster innovation and support Lone Star College–Tomball students and faculty."
+      },
+      "campus": {
+        "campus": "Lone Star College – Tomball",
+        "building": "E Building",
+        "room": "E251"
+      },
+      "tags": ["innovation", "xr", "education"]
+    },
+    {
+      "id": "classroom1",
+      "title": "Classroom 1",
+      "folder": "assets/lone-star-college-tomball-classroom1-update",
+      "slug": "classroom1",
+      "thumb": "assets/lone-star-college-tomball-classroom1-update/000-classroom1.jpg",
+      "meta": {
+        "location": "Main Office",
+        "phase": "Completed",
+        "updated": "2025-10-20",
+        "description": "Classroom Update."
+      },
+      "campus": {
+        "campus": "Lone Star College – Tomball",
+        "building": "Commons",
+        "room": ""
+      },
+      "tags": ["student-life", "public-space"]
+    },
+     {
+      "id": "classroom2",
+      "title": "Classroom 2",
+      "folder": "assets/lone-star-college-tomball-classroom2-update",
+      "slug": "classroom2",
+      "thumb": "assets/lone-star-college-tomball-classroom2-update/000-classroom2.jpg",
+      "meta": {
+        "location": "Main Office",
+        "phase": "Completed",
+        "updated": "2025-10-20",
+        "description": "Classroom Update."
+      },
+      "campus": {
+        "campus": "Lone Star College – Tomball",
+        "building": "Commons",
+        "room": ""
+      },
+      "tags": ["student-life", "public-space"]
+    },
+     {
+      "id": "scifi-center",
+      "title": "SciFi Center",
+      "folder": "assets/lone-star-college-tomball-scifi-center",
+      "slug": "scifi-center",
+      "thumb": "assets/lone-star-college-tomball-scifi-center/000-scifi-center.jpg",
+      "meta": {
+        "location": "SciFi Center",
+        "phase": "Completed",
+        "updated": "2025-10-20",
+        "description": "SciFi Center."
+      },
+      "campus": {
+        "campus": "Lone Star College – Tomball",
+        "building": "Commons",
+        "room": ""
+      },
+      "tags": ["student-life", "public-space"]
     },
     {
       "id": "office",
@@ -49,8 +124,14 @@
         "location": "Main Office",
         "phase": "Completed",
         "updated": "2025-10-20",
-        "description": "Work-from-home office refresh with improved lighting, cable management, and a multi‑monitor ergonomic setup."
-      }
+        "description": "Work-from-home office refresh with improved lighting, cable management, and a multi-monitor ergonomic setup."
+      },
+      "campus": {
+        "campus": "Private",
+        "building": "",
+        "room": ""
+      },
+      "tags": ["home", "workspace"]
     },
     {
       "id": "kitchen",
@@ -63,7 +144,13 @@
         "phase": "In Progress",
         "updated": "2025-09-28",
         "description": "Kitchen modernization highlighting new cabinetry, lighting, and expanded prep space."
-      }
+      },
+      "campus": {
+        "campus": "Private",
+        "building": "",
+        "room": ""
+      },
+      "tags": ["remodel"]
     },
     {
       "id": "xr-lab",
@@ -76,7 +163,13 @@
         "phase": "Planning",
         "updated": "2025-10-05",
         "description": "Spatial computing classroom with dedicated VR/AR workstations and flexible collaboration areas."
-      }
+      },
+      "campus": {
+        "campus": "Lone Star College – Tomball",
+        "building": "E Building",
+        "room": "E251"
+      },
+      "tags": ["xr", "lab", "education"]
     },
     {
       "id": "deck",
@@ -89,7 +182,13 @@
         "phase": "Completed",
         "updated": "2025-10-26",
         "description": "Outdoor deck refresh with new lighting and seating optimized for evening gatherings."
-      }
+      },
+      "campus": {
+        "campus": "Private",
+        "building": "",
+        "room": ""
+      },
+      "tags": ["outdoor", "lighting"]
     },
     {
       "id": "backyard",
@@ -101,8 +200,14 @@
         "location": "Backyard",
         "phase": "Completed",
         "updated": "2025-08-30",
-        "description": "Landscaping and patio updates to create a cozy, low‑maintenance outdoor space."
-      }
+        "description": "Landscaping and patio updates to create a cozy, low-maintenance outdoor space."
+      },
+      "campus": {
+        "campus": "Private",
+        "building": "",
+        "room": ""
+      },
+      "tags": ["landscaping", "patio"]
     }
   ]
 }
