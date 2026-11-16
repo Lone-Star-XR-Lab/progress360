@@ -1,12 +1,14 @@
 // Progress360 gallery: loads the project list, renders cards, handles search/filter and
 // hash routing (#/<project-id> opens that project in the viewer).
-import { openViewer, closeViewer, setCloseHandler, isViewerOpen, formatIsoDate, showToast } from './viewer.js';
+import { openViewer, closeViewer, setCloseHandler, setProjectDirectory, isViewerOpen, formatIsoDate, showToast, EMBED_MODE } from './viewer.js';
 import { sortStageFiles, describeStages, MEDIA_RE, IMAGE_RE } from './stages.js';
+import { readExif } from './exif.js';
 
 const BASE_TITLE = document.title;
 const MAX_STAGE_INDEX = 40;     // highest NNN probed when stages are auto-discovered
 const PHASE_ORDER = ['Planning', 'In Progress', 'Completed'];
 const VIDEO_RE = /\.(mp4|webm|ogv|mov)(\?|#|$)/i;
+const NEW_DAYS = 30;            // "New" badge for projects updated within this many days
 
 const els = {
   gallery: document.getElementById('gallery'),
@@ -14,10 +16,17 @@ const els = {
   chips: document.getElementById('phaseFilters'),
   count: document.getElementById('resultCount'),
   empty: document.getElementById('emptyState'),
+  sort: document.getElementById('sortSelect'),
+  group: document.getElementById('groupSelect'),
+  gridBtn: document.getElementById('gridViewBtn'),
+  mapBtn: document.getElementById('mapViewBtn'),
+  mapView: document.getElementById('mapView'),
+  map: document.getElementById('map'),
+  mapNote: document.getElementById('mapNote'),
 };
 
 let projects = [];
-const filter = { q: '', phase: 'all' };
+const filter = { q: '', phase: 'all', sort: pref('sort', 'updated'), group: pref('group', 'none'), view: pref('view', 'grid') };
 const stageCache = new Map();    // id -> Promise<Stage[]>
 const thumbCache = new Map();    // id -> Promise<string|null>
 let openedFromGallery = false;   // true when the viewer hash was pushed by in-app navigation
@@ -37,10 +46,18 @@ const _thumbBitmapMap = new Map(); // key -> Map(yaw -> ImageBitmap)
     if(openedFromGallery){ openedFromGallery = false; history.back(); }
     else location.hash = '';
   });
+  if(EMBED_MODE) document.body.classList.add('embed');
   projects = (await loadProjects()).map(normalizeProject);
+  setProjectDirectory(Object.fromEntries(projects.map((p)=> [p.id, p.title])));
+  if(els.sort) els.sort.value = filter.sort;
+  if(els.group) els.group.value = filter.group;
   renderChips();
-  renderGallery();
+  setGalleryView(filter.view);
   els.search?.addEventListener('input', ()=> { filter.q = els.search.value.trim().toLowerCase(); renderGallery(); });
+  els.sort?.addEventListener('change', ()=> { filter.sort = els.sort.value; setPref('sort', filter.sort); renderGallery(); });
+  els.group?.addEventListener('change', ()=> { filter.group = els.group.value; setPref('group', filter.group); renderGallery(); });
+  els.gridBtn?.addEventListener('click', ()=> setGalleryView('grid'));
+  els.mapBtn?.addEventListener('click', ()=> setGalleryView('map'));
   els.gallery?.addEventListener('click', (e)=>{
     if(e.target.closest('a.card-link') && !e.metaKey && !e.ctrlKey && !e.shiftKey && e.button === 0) openedFromGallery = true;
   });
@@ -124,13 +141,19 @@ function normalizeProject(p){
 // ---------------------------------------------------------------------------
 // Routing
 // ---------------------------------------------------------------------------
-function currentRouteId(){
+// #/<id>?stage=2&yaw=30&pitch=-5  →  { id, opts }
+function currentRoute(){
   const h = location.hash.replace(/^#\/?/, '');
-  try { return decodeURIComponent(h); } catch { return h; }
+  const [rawId, query = ''] = h.split('?');
+  let id = rawId;
+  try { id = decodeURIComponent(rawId); } catch {}
+  const q = new URLSearchParams(query);
+  const num = (k)=> (q.has(k) && Number.isFinite(parseFloat(q.get(k))) ? parseFloat(q.get(k)) : undefined);
+  return { id, opts: { stage: num('stage'), yaw: num('yaw'), pitch: num('pitch') } };
 }
 
 function route(){
-  const id = currentRouteId();
+  const { id, opts } = currentRoute();
   if(!id){
     if(location.hash === '#') history.replaceState(null, '', location.pathname + location.search);
     openedFromGallery = false;
@@ -147,14 +170,10 @@ function route(){
   }
   document.title = `${p.title} · ${BASE_TITLE}`;
   openViewer({
-    id: p.id,
-    title: p.title,
-    meta: p.meta,
-    campus: p.campus,
-    tags: p.tags,
+    ...p,
     description: p.description || '',
     stages: resolveStages(p),
-  }).catch((err)=> console.error('Viewer failed to open', err));
+  }, opts).catch((err)=> console.error('Viewer failed to open', err));
 }
 
 // ---------------------------------------------------------------------------
@@ -278,13 +297,43 @@ function matches(p){
 }
 
 const cardCache = new Map();   // id -> element (keeps thumb animation state across filtering)
+function sortProjects(list){
+  const byTitle = (a, b)=> a.title.localeCompare(b.title, undefined, { numeric: true, sensitivity: 'base' });
+  if(filter.sort === 'name') return list.slice().sort(byTitle);
+  if(filter.sort === 'updated') return list.slice().sort((a, b)=> (b.meta.updated || '').localeCompare(a.meta.updated || '') || byTitle(a, b));
+  return list;
+}
+
+function groupKey(p){
+  if(filter.group === 'site') return p.campus.campus || 'Other';
+  if(filter.group === 'phase') return p.meta.phase || 'No phase';
+  return '';
+}
+
 function renderGallery(){
   if(!els.gallery) return;
-  const list = projects.filter(matches);
-  els.gallery.replaceChildren(...list.map((p)=>{
-    if(!cardCache.has(p.id)) cardCache.set(p.id, createCard(p));
-    return cardCache.get(p.id);
-  }));
+  const list = sortProjects(projects.filter(matches));
+  const nodes = [];
+  if(filter.group === 'none'){
+    list.forEach((p)=> nodes.push(cardFor(p)));
+  } else {
+    const groups = new Map();
+    list.forEach((p)=> { const k = groupKey(p); if(!groups.has(k)) groups.set(k, []); groups.get(k).push(p); });
+    const keys = [...groups.keys()];
+    if(filter.group === 'phase') keys.sort((a, b)=> (PHASE_ORDER.indexOf(a) + 1 || 99) - (PHASE_ORDER.indexOf(b) + 1 || 99));
+    else keys.sort((a, b)=> (a === 'Other') - (b === 'Other') || a.localeCompare(b));
+    for(const k of keys){
+      const h = document.createElement('h2');
+      h.className = 'group-heading';
+      h.textContent = k;
+      const c = document.createElement('span');
+      c.className = 'group-count';
+      c.textContent = String(groups.get(k).length);
+      h.appendChild(c);
+      nodes.push(h, ...groups.get(k).map(cardFor));
+    }
+  }
+  els.gallery.replaceChildren(...nodes);
   if(els.count){
     els.count.textContent = projects.length
       ? (list.length === projects.length ? `${projects.length} projects` : `${list.length} of ${projects.length} projects`)
@@ -296,7 +345,157 @@ function renderGallery(){
       ? 'No projects match your search.'
       : 'No projects found. Add one to assets/projects.json — see docs/adding-projects.md.';
   }
+  if(filter.view === 'map') renderMap(list);
 }
+
+function cardFor(p){
+  if(!cardCache.has(p.id)) cardCache.set(p.id, createCard(p));
+  return cardCache.get(p.id);
+}
+
+function isNew(p){
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(p.meta.updated || '');
+  if(!m) return false;
+  const age = (Date.now() - new Date(+m[1], +m[2] - 1, +m[3]).getTime()) / 864e5;
+  return age >= 0 && age <= NEW_DAYS;
+}
+
+// ---------------------------------------------------------------------------
+// Map view (Leaflet, vendored; OpenStreetMap tiles). A project's location comes from
+// meta.gps in projects.json, or else from the GPS EXIF of its first image.
+// ---------------------------------------------------------------------------
+function setGalleryView(view){
+  filter.view = view === 'map' ? 'map' : 'grid';
+  setPref('view', filter.view);
+  els.gridBtn?.setAttribute('aria-pressed', String(filter.view === 'grid'));
+  els.mapBtn?.setAttribute('aria-pressed', String(filter.view === 'map'));
+  if(els.gallery) els.gallery.hidden = filter.view === 'map';
+  if(els.mapView) els.mapView.hidden = filter.view !== 'map';
+  if(els.group) els.group.disabled = filter.view === 'map';
+  renderGallery();
+}
+
+let leafletP = null;
+function ensureLeaflet(){
+  if(window.L) return Promise.resolve(window.L);
+  if(!leafletP){
+    leafletP = new Promise((resolve, reject)=>{
+      const css = document.createElement('link');
+      css.rel = 'stylesheet'; css.href = 'vendor/leaflet/leaflet.css';
+      document.head.appendChild(css);
+      const js = document.createElement('script');
+      js.src = 'vendor/leaflet/leaflet.js';
+      js.onload = ()=> resolve(window.L);
+      js.onerror = reject;
+      document.head.appendChild(js);
+    });
+  }
+  return leafletP;
+}
+
+// Private projects (campus "Private", e.g. someone's home) never use the GPS stored in their
+// photos: they only appear on the map with an explicit meta.gps. meta.gps: false hides any project.
+const isPrivate = (p)=> /^private$/i.test(String(p.campus.campus || '').trim());
+
+async function gpsFor(p){
+  const g = p.meta.gps;
+  if(g === false) return null;
+  if(Array.isArray(g) && g.length === 2) return { lat: +g[0], lon: +g[1] };
+  if(g && Number.isFinite(+g.lat) && Number.isFinite(+(g.lon ?? g.lng))) return { lat: +g.lat, lon: +(g.lon ?? g.lng) };
+  if(isPrivate(p)) return null;
+  const stages = await resolveStages(p);
+  for(const s of stages){
+    if(!/\.jpe?g(\?|#|$)/i.test(s.url)) continue;
+    const { gps } = await readExif(s.url);
+    if(gps) return gps;
+  }
+  return null;
+}
+
+let map = null, markerLayer = null, mapSeq = 0;
+async function renderMap(list){
+  const seq = ++mapSeq;
+  let L;
+  try { L = await ensureLeaflet(); } catch { if(els.mapNote) els.mapNote.textContent = 'The map could not be loaded.'; return; }
+  if(seq !== mapSeq) return;
+  if(!map){
+    map = L.map(els.map, { scrollWheelZoom: true, worldCopyJump: true }).setView([30.1, -95.6], 10);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    }).addTo(map);
+    markerLayer = L.layerGroup().addTo(map);
+  }
+  setTimeout(()=> map.invalidateSize(), 0);
+  if(els.mapNote) els.mapNote.textContent = 'Finding project locations…';
+  const located = await Promise.all(list.map(async (p)=> ({ p, gps: await gpsFor(p).catch(()=> null) })));
+  if(seq !== mapSeq) return;
+
+  // Projects within ~100 m of each other (same building) share one marker
+  const spots = new Map();
+  for(const { p, gps } of located){
+    if(!gps) continue;
+    const k = `${gps.lat.toFixed(3)},${gps.lon.toFixed(3)}`;
+    if(!spots.has(k)) spots.set(k, { sum: { lat: 0, lon: 0 }, items: [] });
+    const spot = spots.get(k);
+    spot.items.push(p);
+    spot.sum.lat += gps.lat; spot.sum.lon += gps.lon;
+  }
+  for(const spot of spots.values()) spot.gps = { lat: spot.sum.lat / spot.items.length, lon: spot.sum.lon / spot.items.length };
+  markerLayer.clearLayers();
+  const bounds = [];
+  for(const { gps, items } of spots.values()){
+    const icon = L.divIcon({
+      className: 'map-pin',
+      html: `<span>${items.length > 1 ? items.length : ''}</span>`,
+      iconSize: [30, 30],
+      iconAnchor: [15, 15],
+    });
+    const m = L.marker([gps.lat, gps.lon], { icon, title: items.map((p)=> p.title).join(', ') });
+    m.bindPopup(()=> mapPopup(items), { maxWidth: 280, minWidth: 220 });
+    markerLayer.addLayer(m);
+    bounds.push([gps.lat, gps.lon]);
+  }
+  if(bounds.length === 1) map.setView(bounds[0], 17);
+  else if(bounds.length) map.fitBounds(bounds, { padding: [40, 40], maxZoom: 17 });
+  const unplaced = located.filter((x)=> !x.gps);
+  const hidden = unplaced.filter((x)=> x.p.meta.gps === false || isPrivate(x.p)).length;
+  const missing = unplaced.filter((x)=> !(x.p.meta.gps === false || isPrivate(x.p))).map((x)=> x.p.title);
+  const shown = located.length - unplaced.length;
+  if(els.mapNote){
+    const parts = [`${shown} project${shown === 1 ? '' : 's'} on the map.`];
+    if(hidden) parts.push(`${hidden} private project${hidden === 1 ? ' is' : 's are'} not shown.`);
+    if(missing.length) parts.push(`No location yet (add meta.gps): ${missing.join(', ')}.`);
+    els.mapNote.textContent = parts.join(' ');
+  }
+}
+
+function mapPopup(items){
+  const root = document.createElement('div');
+  root.className = 'map-popup';
+  for(const p of items){
+    const a = document.createElement('a');
+    a.href = `#/${encodeURIComponent(p.id)}`;
+    a.className = 'map-item';
+    a.addEventListener('click', ()=> { openedFromGallery = true; });
+    const img = document.createElement('img');
+    img.alt = '';
+    resolveThumb(p).then((u)=> { if(u) img.src = u; });
+    const text = document.createElement('span');
+    const t = document.createElement('strong'); t.textContent = p.title;
+    const sub = document.createElement('small'); sub.textContent = [p.meta.phase, p.campus.room || p.meta.location].filter(Boolean).join(' · ');
+    text.append(t, sub);
+    a.append(img, text);
+    root.appendChild(a);
+  }
+  return root;
+}
+
+function pref(key, fallback){
+  try { const v = localStorage.getItem(`p360:gallery:${key}`); return v == null ? fallback : JSON.parse(v); }
+  catch { return fallback; }
+}
+function setPref(key, value){ try { localStorage.setItem(`p360:gallery:${key}`, JSON.stringify(value)); } catch {} }
 
 const icon = (id)=> `<svg class="icon" aria-hidden="true"><use href="#${id}"/></svg>`;
 
@@ -323,6 +522,12 @@ function createCard(p){
   const badges = document.createElement('div');
   badges.className = 'card-badges';
   badges.innerHTML = `<span class="badge">360°</span>`;
+  if(isNew(p)){
+    const nb = document.createElement('span');
+    nb.className = 'badge new';
+    nb.textContent = 'New';
+    badges.appendChild(nb);
+  }
   const cta = document.createElement('span');
   cta.className = 'card-cta';
   cta.textContent = 'Step inside →';

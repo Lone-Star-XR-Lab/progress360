@@ -1,9 +1,10 @@
 // Progress360 viewer
 // Renders a project's stages (equirectangular images or videos) on the inside of a sphere,
-// cross-fades between stages, and exposes non-destructive colour adjustments.
+// cross-fades between stages, shows them side by side (split view), and supports per-stage
+// alignment, hotspots, share/embed links and an in-browser editor (?edit).
 //
-// Colour pipeline (see docs/viewer.md):
-//   texture (sRGB, decoded to linear by the GPU) -> stage cross-fade (linear)
+// Colour pipeline (see docs/architecture.md):
+//   texture (sRGB, decoded to linear by the GPU) -> stage cross-fade / split (linear)
 //   -> exposure (linear, in EV stops) -> midtones / contrast / saturation (display space)
 //   -> three.js output encoding (back to sRGB for the canvas / XR layer).
 // With every adjustment at its default the image on screen is pixel-for-pixel the source file.
@@ -11,12 +12,18 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { readExif } from './exif.js';
 
 const VIDEO_RE = /\.(mp4|webm|ogv|mov)(\?|#|$)/i;
 const JPEG_RE = /\.jpe?g(\?|#|$)/i;
 const isVideoUrl = (u)=> VIDEO_RE.test(u || '');
 
+const PARAMS = new URLSearchParams(location.search);
+export const EDIT_MODE = PARAMS.has('edit');
+export const EMBED_MODE = PARAMS.has('embed');
+
 const STORE_PREFIX = 'p360:v2:';            // v2: old (pre colour-fix) settings are ignored
+const DRAFT_PREFIX = 'p360:draft:';
 const DEFAULT_FOV = 75;
 const MIN_FOV = 30;
 const MAX_FOV = 100;
@@ -43,6 +50,7 @@ let onRequestClose = null;
 let lastFocus = null;
 let saveTimer = 0;
 let hintTimer = 0;
+let directory = {};            // project id -> title (for hotspot links)
 
 const state = {
   open: false,
@@ -52,24 +60,35 @@ const state = {
   textures: [],
   videos: [],
   failed: [],
+  full: [],              // true once the full-resolution texture is in (vs. a preview)
   loaded: 0,
   pos: 0,                // float 0..stages.length-1
   index: 0,              // floor(pos)
-  tween: null,           // { from, to, start, dur }
-  playing: false,        // auto-advancing through stages
-  nextAt: 0,             // performance.now() time of the next auto-advance
+  tween: null,           // { from, to, start, dur, wrap }
+  playing: false,
+  nextAt: 0,
   adj: { ...DEFAULT_ADJ },
   comparing: false,
   audio: false,
   sidebarOpen: true,
+  split: { on: false, left: 0, pos: 0.5 },
+  aligning: false,
+  draft: null,           // editor draft: { view?, align?, hotspots? } (each replaces the project's field)
+  hotspots: [],          // [{ el, dir }]
 };
 
 const narrowMQ = window.matchMedia('(max-width: 960px)');
 const clamp = (v, lo, hi)=> Math.min(hi, Math.max(lo, v));
+const rad = (d)=> d * Math.PI / 180;
+const deg = (r)=> r * 180 / Math.PI;
+const round1 = (v)=> Math.round(v * 10) / 10;
 
 /** Let the host page decide what "close" means (e.g. clear the URL hash). */
 export function setCloseHandler(fn){ onRequestClose = typeof fn === 'function' ? fn : null; }
 function requestClose(){ (onRequestClose || closeViewer)(); }
+
+/** id -> title map of all projects, used to label hotspot links. */
+export function setProjectDirectory(map){ directory = { ...map }; }
 
 // ---------------------------------------------------------------------------
 // Persistence (per project, browser-local)
@@ -88,7 +107,7 @@ function saveNow(){
   if(!state.project) return;
   const data = {
     pos: Math.round(state.pos),
-    view: controls ? [controls.getAzimuthalAngle(), controls.getPolarAngle()] : undefined,
+    look: camera ? (({ yaw, pitch })=> [round1(yaw), round1(pitch)])(currentYawPitch()) : undefined,
     fov: camera ? camera.fov : DEFAULT_FOV,
     adj: state.adj,
   };
@@ -99,6 +118,25 @@ function pref(key, fallback){
   catch { return fallback; }
 }
 function setPref(key, value){ try { localStorage.setItem(`p360:${key}`, JSON.stringify(value)); } catch {} }
+
+// ---------------------------------------------------------------------------
+// Project data helpers (alignment, hotspots, start view; editor draft overrides)
+// ---------------------------------------------------------------------------
+function stageKey(i){
+  const url = state.stages[i]?.url || '';
+  const name = url.split(/[?#]/)[0].split('/').pop();
+  try { return decodeURIComponent(name); } catch { return name; }
+}
+function field(name){
+  if(state.draft && name in state.draft) return state.draft[name];
+  return state.project?.[name];
+}
+function alignDeg(i){ return Number(field('align')?.[stageKey(i)]) || 0; }
+function hotspotList(){ return Array.isArray(field('hotspots')) ? field('hotspots') : []; }
+function startView(){
+  const v = field('view') || {};
+  return { yaw: Number(v.yaw) || 0, pitch: Number(v.pitch) || 0, fov: Number(v.fov) || DEFAULT_FOV };
+}
 
 // ---------------------------------------------------------------------------
 // UI binding (runs once)
@@ -116,13 +154,22 @@ function bindUI(){
     loading: $('loadingOverlay'),
     loadingText: $('loadingText'),
     dragHint: $('dragHint'),
+    hotspotLayer: $('hotspotLayer'),
+    splitUi: $('splitUi'),
+    splitHandle: $('splitHandle'),
+    splitLeft: $('splitLeft'),
+    splitRight: $('splitRight'),
     range: $('timelineRange'),
     filmstrip: $('filmstrip'),
     play: $('playBtn'),
     prev: $('prevBtn'),
     next: $('nextBtn'),
     close: $('closeViewer'),
+    openFull: $('openFullBtn'),
     audio: $('audioBtn'),
+    split: $('splitBtn'),
+    share: $('shareBtn'),
+    sharePanel: $('sharePanel'),
     recenter: $('recenterBtn'),
     fullscreen: $('fullscreenBtn'),
     sidebarBtn: $('sidebarBtn'),
@@ -141,10 +188,12 @@ function bindUI(){
     autoBtn: $('autoAdjustBtn'),
     compareBtn: $('compareBtn'),
     resetBtn: $('resetAdjustBtn'),
+    editor: $('editorPanel'),
     toastHost: $('toastHost'),
   });
   if(!ui.modal || !ui.wrap) throw new Error('Viewer markup not found');
   bound = true;
+  if(EMBED_MODE) document.body.classList.add('embed');
 
   ui.adj = {};
   for(const key of Object.keys(ADJUSTMENTS)){
@@ -156,12 +205,13 @@ function bindUI(){
   }
 
   ui.close?.addEventListener('click', requestClose);
+  ui.play?.addEventListener('click', ()=> setPlaying(!state.playing));
   ui.prev?.addEventListener('click', ()=> nudge(-1));
   ui.next?.addEventListener('click', ()=> nudge(+1));
-  ui.play?.addEventListener('click', ()=> setPlaying(!state.playing));
   ui.range?.addEventListener('input', ()=> { setPlaying(false); state.tween = null; setStagePos(parseFloat(ui.range.value)); });
   ui.range?.addEventListener('change', ()=> animateTo(Math.round(parseFloat(ui.range.value))));
   ui.audio?.addEventListener('click', ()=> setAudio(!state.audio));
+  ui.split?.addEventListener('click', ()=> setSplit(!state.split.on));
   ui.recenter?.addEventListener('click', recenter);
   ui.fullscreen?.addEventListener('click', toggleFullscreen);
   ui.sidebarBtn?.addEventListener('click', ()=> setSidebar(!state.sidebarOpen, true));
@@ -173,16 +223,44 @@ function bindUI(){
   const cmpOn = (e)=> { e.preventDefault?.(); setComparing(true); };
   const cmpOff = ()=> setComparing(false);
   ui.compareBtn?.addEventListener('pointerdown', cmpOn);
-  ['pointerup', 'pointerleave', 'pointercancel', 'blur'].forEach(ev=> ui.compareBtn?.addEventListener(ev, cmpOff));
+  ['pointerup', 'pointerleave', 'pointercancel', 'blur'].forEach((ev)=> ui.compareBtn?.addEventListener(ev, cmpOff));
   ui.compareBtn?.addEventListener('keydown', (e)=> { if((e.key === ' ' || e.key === 'Enter') && !e.repeat) cmpOn(e); });
   ui.compareBtn?.addEventListener('keyup', (e)=> { if(e.key === ' ' || e.key === 'Enter') cmpOff(); });
+
+  // Split view: divider drag + stage pickers
+  const dragSplit = (e)=>{
+    const r = ui.wrap.getBoundingClientRect();
+    setSplitPos((e.clientX - r.left) / r.width);
+  };
+  ui.splitHandle?.addEventListener('pointerdown', (e)=>{
+    e.preventDefault();
+    ui.splitHandle.setPointerCapture(e.pointerId);
+    ui.splitHandle.addEventListener('pointermove', dragSplit);
+  });
+  ['pointerup', 'pointercancel'].forEach((ev)=> ui.splitHandle?.addEventListener(ev, ()=> ui.splitHandle.removeEventListener('pointermove', dragSplit)));
+  ui.splitHandle?.addEventListener('keydown', (e)=>{
+    if(e.key === 'ArrowLeft'){ setSplitPos(state.split.pos - 0.05); e.preventDefault(); e.stopPropagation(); }
+    if(e.key === 'ArrowRight'){ setSplitPos(state.split.pos + 0.05); e.preventDefault(); e.stopPropagation(); }
+  });
+  ui.splitLeft?.addEventListener('change', ()=> { state.split.left = +ui.splitLeft.value; refreshTextures(); });
+  ui.splitRight?.addEventListener('change', ()=> setStagePos(+ui.splitRight.value));
+
+  // Share
+  ui.share?.addEventListener('click', (e)=> { e.stopPropagation(); toggleSharePanel(); });
+  ui.sharePanel?.addEventListener('click', (e)=>{
+    const b = e.target.closest('button[data-share]');
+    if(!b) return;
+    shareAction(b.dataset.share);
+    toggleSharePanel(false);
+  });
+  document.addEventListener('click', (e)=> { if(ui.sharePanel && !ui.sharePanel.hidden && !ui.sharePanel.contains(e.target)) toggleSharePanel(false); });
 
   // Zoom (field of view): wheel + pinch
   ui.wrap.addEventListener('wheel', (e)=> { e.preventDefault(); zoomBy(e.deltaY * 0.04); }, { passive: false });
   let pinch = 0;
   const dist = (t)=> Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
   ui.wrap.addEventListener('touchstart', (e)=> { if(e.touches.length === 2) pinch = dist(e.touches); }, { passive: true });
-  ui.wrap.addEventListener('touchmove', (e)=> {
+  ui.wrap.addEventListener('touchmove', (e)=>{
     if(e.touches.length !== 2 || !pinch) return;
     const d = dist(e.touches);
     zoomBy((pinch - d) * 0.15);
@@ -196,9 +274,9 @@ function bindUI(){
 
   // Block page pinch-zoom (iOS) while the viewer is open
   const blockGesture = (e)=> { if(state.open) e.preventDefault(); };
-  ['gesturestart', 'gesturechange', 'gestureend'].forEach(ev=> document.addEventListener(ev, blockGesture, { passive: false }));
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach((ev)=> document.addEventListener(ev, blockGesture, { passive: false }));
 
-  const onFsChange = ()=> {
+  const onFsChange = ()=>{
     const on = !!fullscreenElement();
     ui.fullscreen?.setAttribute('aria-pressed', String(on));
     ui.fullscreen?.setAttribute('title', on ? 'Exit full screen (F)' : 'Full screen (F)');
@@ -208,8 +286,10 @@ function bindUI(){
   document.addEventListener('fullscreenchange', onFsChange);
   document.addEventListener('webkitfullscreenchange', onFsChange);
   if(!canFullscreen() && ui.fullscreen) ui.fullscreen.hidden = true;
+  if(ui.share && !navigator.share) ui.sharePanel?.querySelector('[data-share="native"]')?.setAttribute('hidden', '');
 
   narrowMQ.addEventListener?.('change', ()=> setSidebar(narrowMQ.matches ? false : pref('sidebar', true)));
+  if(EDIT_MODE) bindEditor();
   renderAdjustmentUI();
 }
 
@@ -254,6 +334,7 @@ function initRenderer(){
     c1.addEventListener('squeeze', endXR);
     scene.add(c0, c1);
   }catch{}
+  renderer.xr.addEventListener('sessionstart', ()=> { setSplit(false); stopAligning(); });
 
   // Only show the VR button where immersive VR is actually available
   navigator.xr?.isSessionSupported?.('immersive-vr').then((ok)=>{
@@ -273,7 +354,10 @@ function createPanoMaterial(){
     uniforms: {
       map1: { value: null },
       map2: { value: null },
+      off1: { value: 0 },         // per-stage alignment (fraction of a full turn)
+      off2: { value: 0 },
       mixAmount: { value: 0 },
+      split: { value: -1 },       // split-view divider in device pixels; <0 = off
       exposure: { value: 0 },     // EV stops
       contrast: { value: 1 },     // multiplier around mid grey
       midtones: { value: 1 },     // gamma exponent (<1 brightens)
@@ -291,7 +375,10 @@ function createPanoMaterial(){
       varying vec2 vUv;
       uniform sampler2D map1;
       uniform sampler2D map2;
+      uniform float off1;
+      uniform float off2;
       uniform float mixAmount;
+      uniform float split;
       uniform float exposure;
       uniform float contrast;
       uniform float midtones;
@@ -309,7 +396,10 @@ function createPanoMaterial(){
       void main(){
         vec2 uv = vec2(1.0 - vUv.x, vUv.y);
         // Textures are tagged sRGB, so the GPU hands us linear values here. Do NOT decode again.
-        vec3 col = mix(texture2D(map1, uv).rgb, texture2D(map2, uv).rgb, clamp(mixAmount, 0.0, 1.0));
+        vec3 a = texture2D(map1, vec2(uv.x + off1, uv.y)).rgb;
+        vec3 b = texture2D(map2, vec2(uv.x + off2, uv.y)).rgb;
+        float m = split >= 0.0 ? step(split, gl_FragCoord.x) : clamp(mixAmount, 0.0, 1.0);
+        vec3 col = mix(a, b, m);
         col *= exp2(exposure);
 
         // Tone controls feel natural in display (perceptual) space
@@ -331,7 +421,7 @@ function createPanoMaterial(){
 
 function configureTexture(t){
   t.colorSpace = THREE.SRGBColorSpace;
-  t.wrapS = THREE.RepeatWrapping;           // avoids a visible seam at the 0/360° join
+  t.wrapS = THREE.RepeatWrapping;           // seamless 0/360° join, and lets alignment wrap around
   t.wrapT = THREE.ClampToEdgeWrapping;
   t.anisotropy = renderer.capabilities.getMaxAnisotropy();
   t.needsUpdate = true;
@@ -349,8 +439,7 @@ function render(){
       : (k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2);
     if(wrap && k < 1){
       // Last stage → first stage: fade directly instead of rewinding through every stage
-      material.uniforms.map1.value = textureAt(from);
-      material.uniforms.map2.value = textureAt(to);
+      setSlots(from, to);
       material.uniforms.mixAmount.value = e;
     } else {
       setStagePos(from + (to - from) * e, { persist: k >= 1 });
@@ -363,6 +452,7 @@ function render(){
     advancePlayback(now);
   }
   controls.update();
+  if(state.hotspots.length) positionHotspots();
   renderer.render(scene, camera);
 }
 
@@ -374,27 +464,52 @@ function onResize(){
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  if(state.split.on) refreshTextures();
 }
 
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
-function loadStage(i, url, token){
-  return new Promise((resolve)=>{
-    const done = (tex, video)=>{
-      if(token !== state.token){ tex?.dispose(); disposeVideo(video); resolve(); return; }
-      state.textures[i] = tex || null;
-      state.videos[i] = video || null;
-      state.failed[i] = !tex;
-      state.loaded++;
-      updateProgress();
-      refreshTextures();
-      syncMedia();
-      updateFilmstrip();
-      resolve();
-    };
+const headCache = new Map();
+function headExists(url){
+  if(!headCache.has(url)){
+    headCache.set(url, fetch(url, { method: 'HEAD' }).then((r)=> r.ok).catch(()=> false));
+  }
+  return headCache.get(url);
+}
 
-    if(isVideoUrl(url)){
+// Phones and GPUs limited to 4096 px textures get the <name>-4k.jpg variant when it exists
+function preferSmall(){
+  return renderer.capabilities.maxTextureSize <= 4096 || window.matchMedia('(max-width: 900px)').matches;
+}
+
+function loadTexture(url){
+  return new Promise((resolve)=> new THREE.TextureLoader().load(url, (t)=> resolve(configureTexture(t)), undefined, ()=> resolve(null)));
+}
+
+async function loadStage(i, url, token, { preview = false } = {}){
+  const stale = ()=> token !== state.token;
+  const accept = (tex, video, isFull)=>{
+    const prev = state.textures[i];
+    if(prev && prev !== tex) prev.dispose();
+    state.textures[i] = tex || null;
+    state.videos[i] = video || null;
+    state.full[i] = !!isFull;
+    refreshTextures();
+    syncMedia();
+    updateFilmstrip();
+  };
+  const finish = (tex, video)=>{
+    if(stale()){ tex?.dispose(); disposeVideo(video); return; }
+    if(tex) accept(tex, video, true);
+    else if(!state.textures[i]) state.failed[i] = true;
+    state.loaded++;
+    updateProgress();
+    updateFilmstrip();
+  };
+
+  if(isVideoUrl(url)){
+    await new Promise((resolve)=>{
       const v = document.createElement('video');
       v.crossOrigin = 'anonymous';
       v.loop = true;
@@ -407,20 +522,41 @@ function loadStage(i, url, token){
       const tex = configureTexture(new THREE.VideoTexture(v));
       v.addEventListener('error', ()=>{
         if(settled){ // failed after we had already accepted it
-          state.failed[i] = true; state.textures[i] = null; tex.dispose(); refreshTextures(); updateFilmstrip();
+          if(state.textures[i] === tex){ state.failed[i] = true; state.textures[i] = null; tex.dispose(); refreshTextures(); updateFilmstrip(); }
           return;
         }
-        settled = true; tex.dispose(); done(null, null);
+        settled = true; tex.dispose(); finish(null, null); resolve();
       }, { once: true });
-      const ok = ()=> { if(!settled){ settled = true; done(tex, v); } };
+      const ok = ()=> { if(!settled){ settled = true; finish(tex, v); resolve(); } };
       v.addEventListener('loadeddata', ok, { once: true });
       setTimeout(ok, 2500);          // some mobile browsers won't fire loadeddata until play()
       try { v.load(); } catch {}
-      return;
-    }
+    });
+    return;
+  }
 
-    new THREE.TextureLoader().load(url, (t)=> done(configureTexture(t)), undefined, ()=> done(null));
-  });
+  let src = url;
+  if(JPEG_RE.test(url) && preferSmall()){
+    const small = url.replace(/\.jpe?g(?=([?#]|$))/i, '-4k.jpg');
+    if(await headExists(small)) src = small;
+    if(stale()) return;
+  }
+  // Show the small card thumbnail first (if there is one) while the full panorama downloads
+  if(preview && JPEG_RE.test(url)){
+    const thumbUrl = url.replace(/\.jpe?g(?=([?#]|$))/i, '-thumb.jpg');
+    const fullP = loadTexture(src);
+    if(await headExists(thumbUrl)){
+      const thumb = await Promise.race([loadTexture(thumbUrl), fullP.then(()=> null)]);
+      if(thumb && !stale() && !state.full[i]){
+        accept(thumb, null, false);
+        showLoading(false);
+        if(ui.status){ ui.status.hidden = false; ui.status.textContent = 'Loading full resolution…'; }
+      } else thumb?.dispose();
+    }
+    finish(await fullP, null);
+    return;
+  }
+  finish(await loadTexture(src), null);
 }
 
 function disposeVideo(v){
@@ -432,10 +568,14 @@ function teardownProject(){
   state.tween = null;
   state.textures.forEach((t)=> t?.dispose());
   state.videos.forEach(disposeVideo);
-  state.textures = []; state.videos = []; state.failed = [];
+  state.textures = []; state.videos = []; state.failed = []; state.full = [];
   state.loaded = 0;
-  if(material){ material.uniforms.map1.value = null; material.uniforms.map2.value = null; }
+  state.split.on = false;
+  state.aligning = false;
+  ui.modal?.classList.remove('is-split', 'is-aligning');
+  if(material){ material.uniforms.map1.value = null; material.uniforms.map2.value = null; material.uniforms.split.value = -1; }
   if(ui.filmstrip) ui.filmstrip.replaceChildren();
+  clearHotspots();
 }
 
 function updateProgress(){
@@ -461,23 +601,46 @@ function showLoading(show, text, isError = false){
   if(text && ui.loadingText) ui.loadingText.textContent = text;
 }
 
-// Pick the texture for stage i, falling back to the nearest loaded stage while others stream in
-function textureAt(i){
+// Index of the nearest stage that has a texture (stages stream in), or -1
+function loadedIndexNear(i){
   const t = state.textures;
-  if(t[i]) return t[i];
+  if(t[i]) return i;
   for(let d = 1; d < t.length; d++){
-    if(t[i - d]) return t[i - d];
-    if(t[i + d]) return t[i + d];
+    if(t[i - d]) return i - d;
+    if(t[i + d]) return i + d;
   }
-  return null;
+  return -1;
+}
+
+function setSlots(i, j){
+  const u = material.uniforms;
+  const a = loadedIndexNear(i);
+  const b = loadedIndexNear(j);
+  const bb = b < 0 ? a : b;
+  u.map1.value = a < 0 ? null : state.textures[a];
+  u.map2.value = bb < 0 ? null : state.textures[bb];
+  u.off1.value = a < 0 ? 0 : alignDeg(a) / 360;
+  u.off2.value = bb < 0 ? 0 : alignDeg(bb) / 360;
 }
 
 function refreshTextures(){
   if(!material) return;
+  const u = material.uniforms;
   const n = state.stages.length;
-  const a = textureAt(state.index);
-  material.uniforms.map1.value = a;
-  material.uniforms.map2.value = textureAt(Math.min(state.index + 1, n - 1)) || a;
+  if(state.split.on){
+    setSlots(state.split.left, state.index);
+    u.mixAmount.value = 0;
+    u.split.value = state.split.pos * renderer.domElement.width;
+    return;
+  }
+  u.split.value = -1;
+  if(state.aligning && state.index > 0){
+    setSlots(state.index - 1, state.index);
+    u.mixAmount.value = 0.5;
+    return;
+  }
+  setSlots(state.index, Math.min(state.index + 1, n - 1));
+  u.mixAmount.value = state.pos - state.index;
 }
 
 // ---------------------------------------------------------------------------
@@ -496,7 +659,6 @@ function setStagePos(v, { persist = true } = {}){
     ui.range.style.setProperty('--fill-to', `${n > 1 ? (pos / (n - 1)) * 100 : 0}%`);
   }
   refreshTextures();
-  if(material) material.uniforms.mixAmount.value = pos - index;
   if(changed) syncMedia();
   updateStageUI();
   if(persist) saveSoon();
@@ -508,7 +670,7 @@ function animateTo(target, dur = TWEEN_MS){
   const to = clamp(Math.round(target), 0, n - 1);
   if(Math.abs(to - state.pos) < 1e-3){ setStagePos(to); return; }
   const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-  if(reduce || !state.open){ setStagePos(to); return; }
+  if(reduce || !state.open || state.split.on || state.aligning){ setStagePos(to); return; }
   state.tween = { from: state.pos, to, start: performance.now(), dur };
 }
 
@@ -517,7 +679,7 @@ function animateTo(target, dur = TWEEN_MS){
 // ---------------------------------------------------------------------------
 function setPlaying(on){
   const n = state.stages.length;
-  on = !!on && n > 1;
+  on = !!on && n > 1 && !state.split.on && !state.aligning;
   if(state.playing === on) return;
   state.playing = on;
   ui.play?.setAttribute('aria-pressed', String(on));
@@ -525,7 +687,6 @@ function setPlaying(on){
   ui.play?.setAttribute('aria-label', on ? 'Pause' : 'Play through stages');
   ui.modal?.classList.toggle('is-playing', on);
   if(on){
-    // Start moving almost straight away so pressing Play feels responsive
     state.nextAt = performance.now() + 350;
     if(!state.tween) showHold(350);
   } else {
@@ -536,7 +697,6 @@ function setPlaying(on){
 function advancePlayback(now){
   const n = state.stages.length;
   let next = (nearestIndex() + 1) % n;
-  // Skip stages that failed to load; wait for ones still loading
   for(let tries = 0; tries < n && state.failed[next]; tries++) next = (next + 1) % n;
   if(!state.textures[next]){ state.nextAt = now + 250; return; }
   clearHold();
@@ -544,11 +704,11 @@ function advancePlayback(now){
   if(next < nearestIndex() && !reduce){
     state.tween = { from: nearestIndex(), to: next, start: now, dur: PLAY_FADE_MS, wrap: true };
     const v = state.videos[next];
-    if(v){ v.muted = true; safePlay(v); }   // the stage fading in should already be moving
+    if(v){ v.muted = true; safePlay(v); }
     return;
   }
   animateTo(next, PLAY_FADE_MS);
-  if(!state.tween) holdStage(now);   // reduced motion: jumped instantly
+  if(!state.tween) holdStage(now);
 }
 
 function holdStage(now){
@@ -556,13 +716,12 @@ function holdStage(now){
   showHold(PLAY_HOLD_MS);
 }
 
-// Progress bar on the active filmstrip item showing how long until the next stage
 function showHold(ms){
   clearHold();
   const el = ui.filmstrip?.children[nearestIndex()];
   if(!el) return;
   el.style.setProperty('--hold', `${ms}ms`);
-  void el.offsetWidth;   // restart the CSS animation
+  void el.offsetWidth;
   el.classList.add('is-holding');
 }
 function clearHold(){
@@ -579,7 +738,7 @@ function nudge(dir){
 function nearestIndex(){ return clamp(Math.round(state.pos), 0, Math.max(0, state.stages.length - 1)); }
 
 let lastUiKey = '';
-function updateStageUI(){
+function updateStageUI(force = false){
   const n = state.stages.length;
   const i = nearestIndex();
   const stage = state.stages[i];
@@ -587,7 +746,7 @@ function updateStageUI(){
   if(ui.next) ui.next.disabled = state.pos >= n - 1.001;
   // Everything below only needs to change when the nearest stage changes (not every tween frame)
   const key = `${state.token}:${n}:${i}`;
-  if(key === lastUiKey) return;
+  if(key === lastUiKey && !force) return;
   lastUiKey = key;
   if(ui.stageLabel) ui.stageLabel.textContent = n ? `${stage?.label || `Stage ${i + 1}`} · ${i + 1} of ${n}` : '';
   if(ui.filmstrip){
@@ -601,9 +760,14 @@ function updateStageUI(){
       }
     }
   }
+  if(ui.splitRight) ui.splitRight.value = String(i);
   updateAudioUI();
   updateInfo();
+  buildHotspots();
+  if(EDIT_MODE) renderEditor();
 }
+
+function stageLabel(i){ return state.stages[i]?.label || `Stage ${i + 1}`; }
 
 function buildFilmstrip(){
   if(!ui.filmstrip) return;
@@ -612,7 +776,7 @@ function buildFilmstrip(){
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'film';
-    b.title = s.label || `Stage ${idx + 1}`;
+    b.title = stageLabel(idx);
     b.addEventListener('click', ()=> { setPlaying(false); animateTo(idx); });
     let media;
     if(isVideoUrl(s.url)){
@@ -621,7 +785,8 @@ function buildFilmstrip(){
       media.src = `${s.url}#t=0.5`;
     } else {
       media = document.createElement('img');
-      media.src = s.url;   // same URL as the texture, so it comes from cache
+      media.src = s.url.replace(/\.jpe?g(?=([?#]|$))/i, '-thumb.jpg');
+      media.onerror = ()=> { media.onerror = null; media.src = s.url; };   // no thumb: use the full image
       media.alt = '';
       media.loading = 'lazy';
       media.decoding = 'async';
@@ -629,7 +794,7 @@ function buildFilmstrip(){
     media.className = 'film-media';
     const label = document.createElement('span');
     label.className = 'film-label';
-    label.textContent = s.label || `Stage ${idx + 1}`;
+    label.textContent = stageLabel(idx);
     b.append(media, label);
     if(isVideoUrl(s.url)){
       const tag = document.createElement('span');
@@ -640,14 +805,52 @@ function buildFilmstrip(){
     frag.appendChild(b);
   });
   ui.filmstrip.replaceChildren(frag);
+
+  // Split-view pickers
+  for(const sel of [ui.splitLeft, ui.splitRight]){
+    if(!sel) continue;
+    sel.replaceChildren(...state.stages.map((_, i)=> new Option(stageLabel(i), String(i))));
+  }
 }
 
 function updateFilmstrip(){
   if(!ui.filmstrip) return;
-  [...ui.filmstrip.children].forEach((el, i)=> {
+  [...ui.filmstrip.children].forEach((el, i)=>{
     el.classList.toggle('is-failed', !!state.failed[i]);
     el.classList.toggle('is-pending', !state.textures[i] && !state.failed[i]);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Split view (side-by-side compare)
+// ---------------------------------------------------------------------------
+function setSplit(on){
+  const n = state.stages.length;
+  on = !!on && n > 1 && !renderer?.xr?.isPresenting;
+  if(on){
+    setPlaying(false);
+    stopAligning();
+    state.tween = null;
+    if(state.split.left >= n) state.split.left = 0;
+    let right = nearestIndex();
+    if(right === state.split.left) right = state.split.left === n - 1 ? 0 : n - 1;
+    state.split.on = true;
+    if(ui.splitLeft) ui.splitLeft.value = String(state.split.left);
+    setStagePos(right);
+  } else {
+    state.split.on = false;
+  }
+  ui.modal?.classList.toggle('is-split', state.split.on);
+  ui.split?.setAttribute('aria-pressed', String(state.split.on));
+  if(ui.splitUi) ui.splitUi.hidden = !state.split.on;
+  setSplitPos(state.split.pos);
+  refreshTextures();
+}
+
+function setSplitPos(p){
+  state.split.pos = clamp(p, 0.02, 0.98);
+  if(ui.splitUi) ui.splitUi.style.setProperty('--split', `${state.split.pos * 100}%`);
+  if(state.split.on) refreshTextures();
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +860,7 @@ function syncMedia(){
   const vids = state.videos;
   if(!vids.some(Boolean)) return;
   const a = state.index;
-  const b = state.pos - a > 0.001 ? a + 1 : a;
+  const b = state.split.on ? state.split.left : (state.pos - a > 0.001 ? a + 1 : a);
   vids.forEach((v, i)=>{
     if(!v) return;
     if(i === a || i === b){
@@ -695,16 +898,26 @@ function updateAudioUI(){
 }
 
 // ---------------------------------------------------------------------------
-// Camera
+// Camera: yaw/pitch in degrees. yaw 0 = the panorama's centre, positive = to the right;
+// pitch positive = up. Hotspots, start views and share links all use this convention.
 // ---------------------------------------------------------------------------
-function setView(theta = 0, phi = Math.PI / 2){
+function dirFromYawPitch(yaw, pitch){
+  const y = rad(yaw), p = rad(pitch);
+  return new THREE.Vector3(Math.sin(y) * Math.cos(p), Math.sin(p), -Math.cos(y) * Math.cos(p));
+}
+function currentYawPitch(){
+  const d = camera.position.clone().negate().normalize();
+  return { yaw: deg(Math.atan2(d.x, -d.z)), pitch: deg(Math.asin(clamp(d.y, -1, 1))) };
+}
+function lookAt(yaw, pitch){
   if(!camera || !controls) return;
-  camera.position.setFromSphericalCoords(0.1, clamp(phi, 0.01, Math.PI - 0.01), theta);
+  camera.position.copy(dirFromYawPitch(yaw, clamp(pitch, -89, 89)).multiplyScalar(-0.1));
   controls.update();
 }
 function recenter(){
-  setView(0, Math.PI / 2);
-  setFov(DEFAULT_FOV);
+  const v = startView();
+  lookAt(v.yaw, v.pitch);
+  setFov(v.fov);
   saveSoon();
 }
 function setFov(f){
@@ -713,6 +926,80 @@ function setFov(f){
   camera.updateProjectionMatrix();
 }
 function zoomBy(delta){ setFov(camera.fov + delta); saveSoon(); }
+
+// ---------------------------------------------------------------------------
+// Hotspots
+// projects.json: "hotspots": [{ "yaw": 30, "pitch": -5, "title": "New lighting", "text": "…",
+//                              "link": "<project id>", "stage": "<file name>" }]
+// `stage` limits a hotspot to one stage; `link` adds a button that opens another project.
+// ---------------------------------------------------------------------------
+function clearHotspots(){
+  state.hotspots = [];
+  ui.hotspotLayer?.replaceChildren();
+}
+
+function buildHotspots(){
+  clearHotspots();
+  if(!ui.hotspotLayer || !state.stages.length) return;
+  const key = stageKey(nearestIndex());
+  hotspotList().forEach((h, idx)=>{
+    if(h.stage && h.stage !== key) return;
+    if(!Number.isFinite(+h.yaw)) return;
+    const el = document.createElement('div');
+    el.className = 'hotspot';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'hotspot-dot';
+    btn.setAttribute('aria-label', h.title || 'Point of interest');
+    btn.setAttribute('aria-expanded', 'false');
+    const label = document.createElement('span');
+    label.className = 'hotspot-label';
+    label.textContent = h.title || '';
+    const pop = document.createElement('div');
+    pop.className = 'hotspot-pop';
+    pop.hidden = true;
+    if(h.title){ const t = document.createElement('strong'); t.textContent = h.title; pop.appendChild(t); }
+    if(h.text){ const p = document.createElement('p'); p.textContent = h.text; pop.appendChild(p); }
+    if(h.link){
+      const a = document.createElement('a');
+      a.href = `#/${encodeURIComponent(h.link)}`;
+      a.className = 'btn';
+      a.textContent = `Go to ${directory[h.link] || h.link} →`;
+      pop.appendChild(a);
+    }
+    if(EDIT_MODE){
+      const rm = document.createElement('button');
+      rm.type = 'button'; rm.className = 'btn ghost small'; rm.textContent = 'Remove (editor)';
+      rm.addEventListener('click', ()=> editRemoveHotspot(idx));
+      pop.appendChild(rm);
+    }
+    btn.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const open = pop.hidden;
+      ui.hotspotLayer.querySelectorAll('.hotspot-pop').forEach((p)=> { p.hidden = true; });
+      ui.hotspotLayer.querySelectorAll('.hotspot-dot').forEach((b)=> b.setAttribute('aria-expanded', 'false'));
+      pop.hidden = !open;
+      btn.setAttribute('aria-expanded', String(open));
+    });
+    el.append(btn, label, pop);
+    ui.hotspotLayer.appendChild(el);
+    state.hotspots.push({ el, dir: dirFromYawPitch(+h.yaw, +h.pitch || 0) });
+  });
+}
+
+const _v = new THREE.Vector3();
+const _look = new THREE.Vector3();
+function positionHotspots(){
+  const w = ui.wrap.clientWidth, h = ui.wrap.clientHeight;
+  camera.getWorldDirection(_look);
+  for(const hs of state.hotspots){
+    const facing = hs.dir.dot(_look);
+    _v.copy(hs.dir).multiplyScalar(100).project(camera);
+    const visible = facing > 0.05 && Math.abs(_v.x) <= 1.1 && Math.abs(_v.y) <= 1.1;
+    hs.el.style.visibility = visible ? 'visible' : 'hidden';
+    if(visible) hs.el.style.transform = `translate(${((_v.x + 1) / 2) * w}px, ${((1 - _v.y) / 2) * h}px)`;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Adjustments (shared by every stage of a project so before/after stay comparable)
@@ -791,10 +1078,9 @@ async function autoAdjust(){
     for(const src of sources){
       if(src instanceof HTMLVideoElement && src.readyState < 2) continue;
       ctx.drawImage(src, 0, 0, W, H);
-      // Ignore the poles (ceiling/floor) which are heavily stretched in equirect images
-      const y0 = Math.floor(H * 0.2), y1 = Math.ceil(H * 0.8);
+      const y0 = Math.floor(H * 0.2), y1 = Math.ceil(H * 0.8);   // skip the stretched poles
       const data = ctx.getImageData(0, y0, W, y1 - y0).data;
-      for(let p = 0; p < data.length; p += 16){   // every 4th pixel is plenty
+      for(let p = 0; p < data.length; p += 16){
         const r = srgbToLinear(data[p] / 255), g = srgbToLinear(data[p + 1] / 255), b = srgbToLinear(data[p + 2] / 255);
         const Y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         logSum += Math.log(1e-4 + Y);
@@ -803,9 +1089,8 @@ async function autoAdjust(){
       }
     }
     if(!count) throw new Error('no pixels');
-    const key = Math.exp(logSum / count);                       // log-average luminance
+    const key = Math.exp(logSum / count);
     const exposure = roundTo(clamp(Math.log2(0.18 / key) * 0.7, -1.5, 1.5), 0.05);
-    // Mild contrast boost for flat images (based on the 5–95% display-space spread)
     lumas.sort((a, b)=> a - b);
     const lo = linearToSrgb(lumas[Math.floor(lumas.length * 0.05)] * Math.pow(2, exposure));
     const hi = linearToSrgb(lumas[Math.floor(lumas.length * 0.95)] * Math.pow(2, exposure));
@@ -821,6 +1106,176 @@ async function autoAdjust(){
 const roundTo = (v, s)=> Math.round(v / s) * s;
 const srgbToLinear = (c)=> c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 const linearToSrgb = (c)=> c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+
+// ---------------------------------------------------------------------------
+// Share
+// ---------------------------------------------------------------------------
+function toggleSharePanel(force){
+  if(!ui.sharePanel) return;
+  const open = force ?? ui.sharePanel.hidden;
+  ui.sharePanel.hidden = !open;
+  ui.share?.setAttribute('aria-expanded', String(open));
+}
+
+function shareUrl({ embed = false } = {}){
+  const { yaw, pitch } = currentYawPitch();
+  const base = `${location.origin}${location.pathname}`;
+  const id = encodeURIComponent(state.project?.id || '');
+  if(embed) return `${base}?embed=1#/${id}`;
+  const q = new URLSearchParams({ stage: String(nearestIndex() + 1), yaw: String(Math.round(yaw)), pitch: String(Math.round(pitch)) });
+  return `${base}#/${id}?${q}`;
+}
+
+async function copyText(text, okMsg){
+  try { await navigator.clipboard.writeText(text); showToast(okMsg, 'success'); return; }
+  catch {}
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch {}
+  ta.remove();
+  if(ok) showToast(okMsg, 'success'); else window.prompt('Copy this:', text);
+}
+
+function shareAction(kind){
+  if(kind === 'link') copyText(shareUrl(), 'Link copied — it opens this stage and view');
+  else if(kind === 'embed'){
+    const code = `<iframe src="${shareUrl({ embed: true })}" title="${(state.project?.title || 'Progress360').replace(/"/g, '&quot;')}" width="100%" height="480" style="border:0;border-radius:12px" allow="fullscreen; xr-spatial-tracking" allowfullscreen></iframe>`;
+    copyText(code, 'Embed code copied');
+  } else if(kind === 'native' && navigator.share){
+    navigator.share({ title: state.project?.title || 'Progress360', url: shareUrl() }).catch(()=>{});
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Editor (?edit): alignment, start view and hotspots. Changes are kept as a draft in this
+// browser and exported as JSON to paste into the project's entry in projects.json.
+// ---------------------------------------------------------------------------
+const ed = {};
+function bindEditor(){
+  if(!ui.editor) return;
+  ui.editor.hidden = false;
+  const $ = (id)=> document.getElementById(id);
+  Object.assign(ed, {
+    alignBtn: $('edAlignBtn'), alignBox: $('edAlignBox'), alignLabel: $('edAlignLabel'),
+    alignRange: $('edAlignRange'), alignVal: $('edAlignVal'),
+    viewBtn: $('edViewBtn'), hsTitle: $('edHsTitle'), hsText: $('edHsText'), hsLink: $('edHsLink'),
+    hsStage: $('edHsStage'), hsAdd: $('edHsAdd'), hsList: $('edHsList'),
+    json: $('edJson'), copy: $('edCopy'), discard: $('edDiscard'),
+  });
+  ed.alignBtn?.addEventListener('click', ()=> state.aligning ? stopAligning() : startAligning());
+  ed.alignRange?.addEventListener('input', ()=> setAlign(parseFloat(ed.alignRange.value)));
+  document.querySelectorAll('[data-align-step]').forEach((b)=> b.addEventListener('click', ()=>{
+    setAlign(alignDeg(nearestIndex()) + parseFloat(b.dataset.alignStep));
+  }));
+  ed.viewBtn?.addEventListener('click', ()=>{
+    const { yaw, pitch } = currentYawPitch();
+    editDraft('view', { yaw: round1(yaw), pitch: round1(pitch), fov: Math.round(camera.fov) });
+    showToast('Start view set (draft)', 'success');
+  });
+  ed.hsAdd?.addEventListener('click', ()=>{
+    const { yaw, pitch } = currentYawPitch();
+    const h = { yaw: round1(yaw), pitch: round1(pitch), title: ed.hsTitle.value.trim() || 'Point of interest' };
+    if(ed.hsText.value.trim()) h.text = ed.hsText.value.trim();
+    if(ed.hsLink.value) h.link = ed.hsLink.value;
+    if(ed.hsStage.checked) h.stage = stageKey(nearestIndex());
+    editDraft('hotspots', [...hotspotList(), h]);
+    ed.hsTitle.value = ''; ed.hsText.value = '';
+    showToast('Hotspot added at the centre of the view (draft)', 'success');
+  });
+  ed.copy?.addEventListener('click', ()=> copyText(ed.json.value, 'JSON copied — paste it into this project in projects.json'));
+  ed.discard?.addEventListener('click', ()=>{
+    if(!confirm('Discard all draft edits for this project?')) return;
+    state.draft = null;
+    try { localStorage.removeItem(DRAFT_PREFIX + state.project.id); } catch {}
+    stopAligning();
+    refreshTextures(); buildHotspots(); renderEditor();
+  });
+}
+
+function editDraft(name, value){
+  state.draft = { ...(state.draft || {}), [name]: value };
+  try { localStorage.setItem(DRAFT_PREFIX + state.project.id, JSON.stringify(state.draft)); } catch {}
+  refreshTextures();
+  buildHotspots();
+  renderEditor();
+}
+
+function editRemoveHotspot(idx){
+  const list = hotspotList().slice();
+  list.splice(idx, 1);
+  editDraft('hotspots', list);
+}
+
+function startAligning(){
+  const i = nearestIndex();
+  if(i < 1){ showToast('Go to a later stage first — it is aligned to the stage before it', 'info'); return; }
+  setPlaying(false);
+  setSplit(false);
+  state.tween = null;
+  setStagePos(i);
+  state.aligning = true;
+  ui.modal.classList.add('is-aligning');
+  refreshTextures();
+  renderEditor();
+}
+function stopAligning(){
+  if(!state.aligning) return;
+  state.aligning = false;
+  ui.modal?.classList.remove('is-aligning');
+  refreshTextures();
+  if(EDIT_MODE) renderEditor();
+}
+function setAlign(v){
+  if(!Number.isFinite(v)) return;
+  v = ((v + 540) % 360) - 180;            // keep in -180..180
+  const align = { ...(field('align') || {}) };
+  const key = stageKey(nearestIndex());
+  if(Math.abs(v) < 0.01) delete align[key]; else align[key] = round1(v);
+  editDraft('align', align);
+}
+
+function renderEditor(){
+  if(!EDIT_MODE || !ui.editor || !state.project) return;
+  const i = nearestIndex();
+  if(ed.alignBtn){
+    ed.alignBtn.textContent = state.aligning ? 'Done aligning' : 'Align this stage';
+    ed.alignBtn.disabled = i < 1 && !state.aligning;
+  }
+  if(ed.alignBox) ed.alignBox.hidden = !state.aligning;
+  if(ed.alignLabel) ed.alignLabel.textContent = `Rotate “${stageLabel(i)}” until it lines up with “${stageLabel(i - 1)}” (shown 50/50).`;
+  const a = alignDeg(i);
+  if(ed.alignRange) ed.alignRange.value = String(a);
+  if(ed.alignVal) ed.alignVal.textContent = `${a > 0 ? '+' : ''}${a.toFixed(1)}°`;
+  if(ed.hsLink && ed.hsLink.options.length !== Object.keys(directory).length + 1){
+    ed.hsLink.replaceChildren(new Option('— no link —', ''),
+      ...Object.entries(directory).filter(([id])=> id !== state.project.id).map(([id, t])=> new Option(t, id)));
+  }
+  if(ed.hsList){
+    ed.hsList.replaceChildren(...hotspotList().map((h, idx)=>{
+      const li = document.createElement('li');
+      const span = document.createElement('span');
+      span.textContent = `${h.title || 'Point'}${h.stage ? ` · ${h.stage}` : ''}${h.link ? ` → ${h.link}` : ''}`;
+      const rm = document.createElement('button');
+      rm.type = 'button'; rm.className = 'icon-btn small'; rm.textContent = '×';
+      rm.setAttribute('aria-label', `Remove ${h.title || 'hotspot'}`);
+      rm.addEventListener('click', ()=> editRemoveHotspot(idx));
+      li.append(span, rm);
+      return li;
+    }));
+  }
+  if(ed.json){
+    const out = {};
+    const view = field('view'); if(view) out.view = view;
+    const align = field('align'); if(align && Object.keys(align).length) out.align = align;
+    const hs = hotspotList(); if(hs.length) out.hotspots = hs;
+    ed.json.value = Object.keys(out).length
+      ? JSON.stringify(out, null, 2).replace(/^\{\n|\n\}$/g, '') + ','
+      : '// Nothing yet: align a stage, set a start view or add a hotspot.';
+  }
+  ui.editor.classList.toggle('has-draft', !!state.draft);
+}
 
 // ---------------------------------------------------------------------------
 // Sidebar, fullscreen, XR, keyboard, hint, toasts
@@ -855,8 +1310,11 @@ function onKeyDown(e){
   if(e.key === 'Escape'){
     if(renderer?.xr?.isPresenting) endXR();
     else if(fullscreenElement()) toggleFullscreen();
+    else if(ui.sharePanel && !ui.sharePanel.hidden) toggleSharePanel(false);
+    else if(state.aligning) stopAligning();
+    else if(state.split.on) setSplit(false);
     else if(narrowMQ.matches && state.sidebarOpen) setSidebar(false);
-    else requestClose();
+    else if(!EMBED_MODE) requestClose();
     e.preventDefault();
     return;
   }
@@ -865,10 +1323,11 @@ function onKeyDown(e){
   if(e.ctrlKey || e.metaKey || e.altKey) return;
   switch(e.key){
     case ' ':
-      if(t?.tagName === 'BUTTON') return;   // let Space activate the focused button
+      if(t?.tagName === 'BUTTON') return;
       if(!e.repeat) setPlaying(!state.playing);
       break;
     case 'p': case 'P': if(!e.repeat) setPlaying(!state.playing); break;
+    case 's': case 'S': if(!e.repeat) setSplit(!state.split.on); break;
     case 'ArrowRight': nudge(+1); break;
     case 'ArrowLeft': nudge(-1); break;
     case 'Home': setPlaying(false); animateTo(0); break;
@@ -933,15 +1392,13 @@ function renderStaticInfo(){
   setText(ui.infoMedia, [imgs && `${imgs} image${imgs > 1 ? 's' : ''}`, vids && `${vids} video${vids > 1 ? 's' : ''}`].filter(Boolean).join(' · '));
 }
 
-const exifCache = new Map();   // url -> Promise<{ taken, gps }>
 let infoSeq = 0;
-
 function updateInfo(){
   const i = nearestIndex();
   const stage = state.stages[i];
   setText(ui.infoStage, stage ? `${stage.label || `Stage ${i + 1}`} (${i + 1} of ${state.stages.length})` : '');
   const fallbackLoc = state.project?.meta?.location;
-  const nameDate = stage?.date ? formatIsoDate(stage.date) : '';   // from a dated file name
+  const nameDate = stage?.date ? formatIsoDate(stage.date) : '';
   if(!stage?.url || !JPEG_RE.test(stage.url)){
     setText(ui.infoTaken, nameDate);
     setText(ui.infoLocation, fallbackLoc);
@@ -951,7 +1408,7 @@ function updateInfo(){
   readExif(stage.url).then(({ exifTaken, httpTaken, gps } = {})=>{
     if(seq !== infoSeq) return;
     setText(ui.infoTaken, exifTaken || nameDate || httpTaken);
-    if(gps && Number.isFinite(gps.lat) && Number.isFinite(gps.lon) && ui.infoLocation){
+    if(gps && ui.infoLocation){
       const a = document.createElement('a');
       a.href = `https://www.google.com/maps?q=${gps.lat},${gps.lon}`;
       a.target = '_blank';
@@ -964,106 +1421,7 @@ function updateInfo(){
   });
 }
 
-function readExif(url){
-  if(!exifCache.has(url)){
-    exifCache.set(url, (async ()=>{
-      try{
-        // EXIF lives in the first few KB; ask for just that (servers without Range support send it all)
-        const r = await fetch(url, { headers: { Range: 'bytes=0-131071' } });
-        if(!r.ok) return {};
-        const lastModified = r.headers.get('last-modified');
-        const buf = await r.arrayBuffer();
-        let meta = {};
-        try { meta = parseBasicExif(buf) || {}; } catch {}
-        const raw = meta.dateTimeOriginal || meta.dateTimeDigitized || meta.dateTime;
-        return { exifTaken: formatExifDate(raw), httpTaken: formatHttpDate(lastModified), gps: meta.gps };
-      }catch{ return {}; }
-    })());
-  }
-  return exifCache.get(url);
-}
-
-function parseBasicExif(arrayBuffer){
-  const data = new DataView(arrayBuffer);
-  if(data.byteLength < 4 || data.getUint16(0) !== 0xFFD8) return {};
-  let offset = 2;
-  while(offset + 4 <= data.byteLength){
-    const marker = data.getUint16(offset);
-    const size = data.getUint16(offset + 2);
-    if((marker & 0xFF00) !== 0xFF00 || size < 2 || marker === 0xFFDA) break;   // not a marker / start of scan
-    if(marker === 0xFFE1 && getString(data, offset + 4, 4) === 'Exif'){
-      return readTIFF(data, offset + 10);
-    }
-    offset += 2 + size;
-  }
-  return {};
-}
-
-function readTIFF(view, base){
-  const little = view.getUint16(base) === 0x4949;
-  const u16 = (o)=> view.getUint16(o, little);
-  const u32 = (o)=> view.getUint32(o, little);
-  const rational = (o)=> { const d = u32(o + 4); return d ? u32(o) / d : 0; };
-  function readIFD(at){
-    const count = u16(at);
-    const tags = new Map();
-    let p = at + 2;
-    for(let i = 0; i < count; i++, p += 12){
-      const tag = u16(p), type = u16(p + 2), num = u32(p + 4);
-      const inline = p + 8;
-      const off = () => u32(inline) + base;
-      let value = null;
-      if(type === 2) value = getString(view, num > 4 ? off() : inline, Math.max(0, num - 1));
-      else if(type === 3) value = num > 1 ? Array.from({ length: num }, (_, k)=> u16(off() + 2 * k)) : u16(inline);
-      else if(type === 4) value = num > 1 ? Array.from({ length: num }, (_, k)=> u32(off() + 4 * k)) : u32(inline);
-      else if(type === 5) value = num > 1 ? Array.from({ length: num }, (_, k)=> rational(off() + 8 * k)) : rational(off());
-      tags.set(tag, value);
-    }
-    return tags;
-  }
-  const ifd0 = readIFD(u32(base + 4) + base);
-  const meta = {};
-  const exifPtr = ifd0.get(0x8769);
-  if(exifPtr){
-    const exif = readIFD(exifPtr + base);
-    if(exif.get(0x9003)) meta.dateTimeOriginal = String(exif.get(0x9003)).trim();
-    if(exif.get(0x9004)) meta.dateTimeDigitized = String(exif.get(0x9004)).trim();
-  }
-  if(ifd0.get(0x0132)) meta.dateTime = String(ifd0.get(0x0132)).trim();
-  const gpsPtr = ifd0.get(0x8825);
-  if(gpsPtr){
-    const gps = readIFD(gpsPtr + base);
-    const lat = gps.get(0x0002), lon = gps.get(0x0004);
-    if(lat && lon){
-      const deg = (a)=> Array.isArray(a) ? a[0] + a[1] / 60 + a[2] / 3600 : a || 0;
-      meta.gps = { lat: deg(lat) * (gps.get(0x0001) === 'S' ? -1 : 1), lon: deg(lon) * (gps.get(0x0003) === 'W' ? -1 : 1) };
-    }
-  }
-  return meta;
-}
-
-function getString(view, offset, len){
-  let s = '';
-  for(let i = 0; i < len && offset + i < view.byteLength; i++){
-    const c = view.getUint8(offset + i);
-    if(c === 0) break;
-    s += String.fromCharCode(c);
-  }
-  return s;
-}
-
-const dateFmt = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 const dayFmt = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' });
-function formatExifDate(s){
-  const m = /^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(s || '');
-  if(!m) return s || '';
-  const d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
-  return isNaN(d) ? s : dateFmt.format(d);
-}
-function formatHttpDate(h){
-  const d = h ? new Date(h) : null;
-  return d && !isNaN(d) ? dateFmt.format(d) : '';
-}
 export function formatIsoDate(s){
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || '');
   if(!m) return s || '';
@@ -1075,10 +1433,12 @@ export function formatIsoDate(s){
 // ---------------------------------------------------------------------------
 /**
  * Open the viewer for a project.
- * @param {object} project  { id, title, meta, campus, tags, stages: Stage[] | Promise<Stage[]> }
- *                          Stage = { label, url }
+ * @param {object} project  projects.json entry, with `stages` as Stage[] or Promise<Stage[]>
+ *                          (Stage = { label, url, date? })
+ * @param {object} [opts]   { stage?: 1-based stage number, yaw?: number, pitch?: number }
+ *                          (from a share link: #/<id>?stage=2&yaw=30&pitch=-5)
  */
-export async function openViewer(project){
+export async function openViewer(project, opts = {}){
   bindUI();
   initRenderer();
 
@@ -1088,16 +1448,23 @@ export async function openViewer(project){
   ui.modal.setAttribute('aria-hidden', 'false');
   ui.modal.removeAttribute('inert');
   document.body.classList.add('viewer-open');
-  setSidebar(narrowMQ.matches ? false : pref('sidebar', true));
+  setSidebar(narrowMQ.matches || EMBED_MODE ? false : pref('sidebar', true));
   if(ui.title) ui.title.textContent = project.title || 'Project';
+  if(ui.openFull) ui.openFull.href = `${location.pathname}#/${encodeURIComponent(project.id)}`;
   renderer.setAnimationLoop(render);
   onResize();
   if(!wasOpen) ui.close?.focus({ preventScroll: true });
 
+  const applyOpts = ()=>{
+    if(Number.isFinite(opts.stage)) setStagePos(clamp(opts.stage - 1, 0, state.stages.length - 1));
+    if(Number.isFinite(opts.yaw)) lookAt(opts.yaw, Number.isFinite(opts.pitch) ? opts.pitch : 0);
+  };
+
   // Re-opening the same project: everything is still in memory
   if(state.project?.id === project.id && state.textures.some(Boolean)){
     syncMedia();
-    updateStageUI();
+    applyOpts();
+    updateStageUI(true);
     return;
   }
 
@@ -1108,7 +1475,8 @@ export async function openViewer(project){
   state.project = project;
   state.stages = [];
   state.pos = 0; state.index = 0;
-  updateStageUI();
+  try { state.draft = EDIT_MODE ? JSON.parse(localStorage.getItem(DRAFT_PREFIX + project.id) || 'null') : null; } catch { state.draft = null; }
+  updateStageUI(true);
   showLoading(true, 'Loading…');
   if(ui.status){ ui.status.hidden = false; ui.status.textContent = 'Loading…'; }
 
@@ -1132,27 +1500,34 @@ export async function openViewer(project){
     ui.range.disabled = n < 2;
   }
   ui.modal.classList.toggle('single-stage', n < 2);
+  if(ui.split) ui.split.hidden = n < 2;
 
   if(!n){
     showLoading(true, 'No media found for this project.', true);
     if(ui.status) ui.status.hidden = true;
-    updateStageUI();
+    updateStageUI(true);
     return;
   }
 
   state.textures = new Array(n).fill(null);
   state.videos = new Array(n).fill(null);
   state.failed = new Array(n).fill(false);
+  state.full = new Array(n).fill(false);
   state.loaded = 0;
 
-  const start = clamp(Math.round(saved.pos ?? 0), 0, n - 1);
+  const start = Number.isFinite(opts.stage)
+    ? clamp(Math.round(opts.stage) - 1, 0, n - 1)
+    : clamp(Math.round(saved.pos ?? 0), 0, n - 1);
   state.pos = start; state.index = start;
-  if(Array.isArray(saved.view)) setView(saved.view[0], saved.view[1]); else setView();
-  setFov(saved.fov ?? DEFAULT_FOV);
-  updateStageUI();
+  const sv = startView();
+  if(Number.isFinite(opts.yaw)) lookAt(opts.yaw, opts.pitch || 0);
+  else if(Array.isArray(saved.look)) lookAt(saved.look[0], saved.look[1]);
+  else lookAt(sv.yaw, sv.pitch);
+  setFov(saved.fov ?? sv.fov);
+  updateStageUI(true);
 
-  // Show the starting stage as soon as possible, then stream the rest in
-  await loadStage(start, state.stages[start].url, token);
+  // Show the starting stage as soon as possible (thumbnail preview first), then stream the rest
+  await loadStage(start, state.stages[start].url, token, { preview: true });
   if(token !== state.token) return;
   setStagePos(start, { persist: false });
   showDragHint();
@@ -1166,6 +1541,7 @@ export function closeViewer(){
   setPlaying(false);
   state.tween = null;
   setComparing(false);
+  toggleSharePanel(false);
   saveNow();
   if(fullscreenElement()) toggleFullscreen();
   endXR();

@@ -8,7 +8,7 @@
 //   IMG_20261115_143022.jpg        dated stage with a short prefix and optional HHMMSS time
 //   999-slug.jpg                   always last      → "Current"
 //   anything-else.jpg              kept, after dated stages, labelled from the file name
-//   *-thumb.jpg                    ignored (card thumbnails)
+//   *-thumb.jpg, *-4k.jpg          ignored (card thumbnails / phone-sized copies)
 //
 // Order: numbered (by number) → dated (oldest first) → other (by name) → 999.
 
@@ -25,7 +25,7 @@ const stem = (name)=> name.replace(/\.[^.]+$/, '');
 /** Classify a file name. Returns null for files that aren't stages. */
 export function parseStageName(path){
   const name = baseName(path);
-  if(!MEDIA_RE.test(name) || /-thumb\.[a-z0-9]+$/i.test(name)) return null;
+  if(!MEDIA_RE.test(name) || /-(thumb|4k)\.[a-z0-9]+$/i.test(name)) return null;
   let m = NUMBERED_RE.exec(name);
   if(m) return { kind: 'numbered', order: parseInt(m[1], 10), name };
   m = DATED_RE.exec(name);

@@ -6,13 +6,18 @@
   <meta name="theme-color" content="#070c16" />
   <meta name="description" content="Explore before and after 360° panoramas of spaces and projects — on the web, your phone, or in VR." />
   <title>Progress360</title>
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <link rel="stylesheet" href="./styles.css" />
-  <!-- three.js examples import the bare specifier "three"; map it (and the addons) to the CDN -->
+  <!-- three.js is vendored (vendor/three); its addons import the bare specifier "three" -->
   <script type="importmap">
   {
     "imports": {
-      "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
-      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+      "three": "./vendor/three/three.module.js",
+      "three/addons/": "./vendor/three/addons/"
     }
   }
   </script>
@@ -39,6 +44,11 @@
       <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z"/></symbol>
       <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
       <symbol id="i-drag" viewBox="0 0 24 24"><path d="M5 9l-3 3 3 3M19 9l3 3-3 3M2 12h20"/></symbol>
+      <symbol id="i-share" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/></symbol>
+      <symbol id="i-split" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 2v20M8 10l-2 2 2 2M16 10l2 2-2 2"/></symbol>
+      <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+      <symbol id="i-map" viewBox="0 0 24 24"><path d="M9 4L3 6v14l6-2 6 2 6-2V4l-6 2-6-2z"/><path d="M9 4v14M15 6v14"/></symbol>
+      <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
     </defs>
   </svg>
 
@@ -62,16 +72,46 @@
         <input id="searchInput" type="search" placeholder="Search projects, places, tags…" aria-label="Search projects" autocomplete="off" />
       </label>
       <div id="phaseFilters" class="chips" role="group" aria-label="Filter by phase"></div>
+      <div class="toolbar-right">
+        <label class="select-wrap">
+          <span class="visually-hidden">Sort</span>
+          <select id="sortSelect" aria-label="Sort projects">
+            <option value="updated">Recently updated</option>
+            <option value="name">Name A–Z</option>
+            <option value="default">Original order</option>
+          </select>
+        </label>
+        <label class="select-wrap">
+          <span class="visually-hidden">Group</span>
+          <select id="groupSelect" aria-label="Group projects">
+            <option value="none">No grouping</option>
+            <option value="site">Group by site</option>
+            <option value="phase">Group by phase</option>
+          </select>
+        </label>
+        <div class="seg" role="group" aria-label="View">
+          <button id="gridViewBtn" class="seg-btn" type="button" aria-pressed="true" title="Grid">
+            <svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg><span>Grid</span>
+          </button>
+          <button id="mapViewBtn" class="seg-btn" type="button" aria-pressed="false" title="Map">
+            <svg class="icon" aria-hidden="true"><use href="#i-map"/></svg><span>Map</span>
+          </button>
+        </div>
+      </div>
     </div>
 
     <p id="resultCount" class="result-count" aria-live="polite"></p>
     <section id="gallery" class="gallery" aria-label="Projects"></section>
+    <section id="mapView" class="map-view" aria-label="Project map" hidden>
+      <div id="map" class="map"></div>
+      <p id="mapNote" class="map-note"></p>
+    </section>
     <p id="emptyState" class="empty" hidden></p>
   </main>
 
   <footer class="site-footer">
     <span>Progress360</span>
-    <span>Drag to look around · ← → to change stage · F for full screen</span>
+    <span>Drag to look around · ← → change stage · S split view · F full screen</span>
   </footer>
 
   <!-- Viewer -->
@@ -88,13 +128,29 @@
         </div>
       </div>
       <div class="viewer-actions">
+        <a id="openFullBtn" class="icon-btn embed-only" href="./" target="_blank" rel="noopener" title="Open in Progress360" aria-label="Open in Progress360">
+          <svg class="icon" aria-hidden="true"><use href="#i-external"/></svg>
+        </a>
         <button id="audioBtn" class="icon-btn" type="button" aria-pressed="false" aria-label="Sound" hidden>
           <svg class="icon when-off" aria-hidden="true"><use href="#i-mute"/></svg>
           <svg class="icon when-on" aria-hidden="true"><use href="#i-sound"/></svg>
         </button>
+        <button id="splitBtn" class="icon-btn" type="button" aria-pressed="false" title="Split view: compare two stages side by side (S)" aria-label="Split view">
+          <svg class="icon" aria-hidden="true"><use href="#i-split"/></svg>
+        </button>
         <button id="recenterBtn" class="icon-btn" type="button" title="Recenter view (R)" aria-label="Recenter view">
           <svg class="icon" aria-hidden="true"><use href="#i-center"/></svg>
         </button>
+        <div class="share-wrap">
+          <button id="shareBtn" class="icon-btn" type="button" title="Share" aria-label="Share" aria-haspopup="true" aria-expanded="false" aria-controls="sharePanel">
+            <svg class="icon" aria-hidden="true"><use href="#i-share"/></svg>
+          </button>
+          <div id="sharePanel" class="menu" role="menu" hidden>
+            <button type="button" role="menuitem" data-share="link">Copy link to this view</button>
+            <button type="button" role="menuitem" data-share="embed">Copy embed code</button>
+            <button type="button" role="menuitem" data-share="native">Share…</button>
+          </div>
+        </div>
         <button id="fullscreenBtn" class="icon-btn" type="button" title="Full screen (F)" aria-label="Full screen" aria-pressed="false">
           <svg class="icon when-off" aria-hidden="true"><use href="#i-expand"/></svg>
           <svg class="icon when-on" aria-hidden="true"><use href="#i-shrink"/></svg>
@@ -108,6 +164,19 @@
     <div class="viewer-body">
       <section id="stageArea" class="stage-area" aria-label="360° view">
         <div id="viewerCanvasWrap" class="viewer-canvas-wrap">
+          <div id="hotspotLayer" class="hotspot-layer"></div>
+          <div id="splitUi" class="split-ui" hidden>
+            <label class="split-label left">
+              <span class="visually-hidden">Left side</span>
+              <select id="splitLeft" aria-label="Stage on the left"></select>
+            </label>
+            <label class="split-label right">
+              <span class="visually-hidden">Right side</span>
+              <select id="splitRight" aria-label="Stage on the right"></select>
+            </label>
+            <div id="splitHandle" class="split-handle" role="slider" tabindex="0" aria-label="Split position" aria-valuemin="0" aria-valuemax="100"><span></span></div>
+          </div>
+          <div class="align-badge">Aligning — previous stage shown 50/50</div>
           <div id="loadingOverlay" class="loading-overlay">
             <div class="spinner" aria-hidden="true"></div>
             <div id="loadingText" class="loading-text">Loading…</div>
@@ -143,6 +212,56 @@
             <svg class="icon" aria-hidden="true"><use href="#i-close"/></svg>
           </button>
         </div>
+
+        <!-- Editor: only shown with ?edit in the URL -->
+        <section id="editorPanel" class="panel editor" hidden>
+          <div class="panel-head">
+            <h3>Editor</h3>
+            <span class="pill draft-pill">Draft</span>
+          </div>
+
+          <div class="ed-block">
+            <div class="ed-title">Align stages</div>
+            <button id="edAlignBtn" class="btn ghost" type="button">Align this stage</button>
+            <div id="edAlignBox" class="ed-align" hidden>
+              <p id="edAlignLabel" class="hint"></p>
+              <div class="slider-head"><label for="edAlignRange">Rotation</label><output id="edAlignVal">0.0°</output></div>
+              <input id="edAlignRange" type="range" min="-180" max="180" step="0.5" value="0" />
+              <div class="btn-row tight">
+                <button class="btn ghost" type="button" data-align-step="-5">−5°</button>
+                <button class="btn ghost" type="button" data-align-step="-0.5">−½°</button>
+                <button class="btn ghost" type="button" data-align-step="0.5">+½°</button>
+                <button class="btn ghost" type="button" data-align-step="5">+5°</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="ed-block">
+            <div class="ed-title">Start view</div>
+            <button id="edViewBtn" class="btn ghost" type="button">Use the current view as the start view</button>
+          </div>
+
+          <div class="ed-block">
+            <div class="ed-title">Hotspots</div>
+            <p class="hint">Point the centre of the view at the spot, then add.</p>
+            <input id="edHsTitle" class="field" type="text" placeholder="Title (e.g. New lighting)" />
+            <textarea id="edHsText" class="field" rows="2" placeholder="Optional description"></textarea>
+            <select id="edHsLink" class="field" aria-label="Link to another project"></select>
+            <label class="check"><input id="edHsStage" type="checkbox" /> Only on this stage</label>
+            <button id="edHsAdd" class="btn" type="button">Add hotspot at view centre</button>
+            <ul id="edHsList" class="ed-list"></ul>
+          </div>
+
+          <div class="ed-block">
+            <div class="ed-title">Paste into projects.json</div>
+            <p class="hint">Add these lines inside this project's entry (after <code>"folder"</code>), then save.</p>
+            <textarea id="edJson" class="field mono" rows="8" readonly></textarea>
+            <div class="btn-row tight">
+              <button id="edCopy" class="btn" type="button">Copy JSON</button>
+              <button id="edDiscard" class="btn ghost" type="button">Discard draft</button>
+            </div>
+          </div>
+        </section>
 
         <section class="panel">
           <h3>About</h3>
@@ -205,6 +324,7 @@
           <ul>
             <li><kbd>←</kbd><kbd>→</kbd> Change stage</li>
             <li><kbd>Space</kbd> Play / pause</li>
+            <li><kbd>S</kbd> Split view</li>
             <li><kbd>F</kbd> Full screen</li>
             <li><kbd>R</kbd> Recenter</li>
             <li><kbd>+</kbd><kbd>−</kbd> Zoom</li>
