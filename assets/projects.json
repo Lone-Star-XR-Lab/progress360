@@ -17,7 +17,10 @@
         "building": "Commons",
         "room": ""
       },
-      "tags": ["student-life", "public-space"]
+      "tags": [
+        "student-life",
+        "public-space"
+      ]
     },
     {
       "id": "garden",
@@ -36,7 +39,10 @@
         "building": "Outdoor Learning",
         "room": "Garden"
       },
-      "tags": ["outdoor", "sustainability"]
+      "tags": [
+        "outdoor",
+        "sustainability"
+      ]
     },
     {
       "id": "ric",
@@ -47,7 +53,7 @@
       "meta": {
         "location": "Main Office",
         "phase": "Completed",
-        "updated": "2025-10-20",
+        "updated": "2026-11-15",
         "description": "The Research and Innovation Center explores and implements new ideas, initiatives, and interventions that foster innovation and support Lone Star College–Tomball students and faculty."
       },
       "campus": {
@@ -55,7 +61,20 @@
         "building": "E Building",
         "room": "E251"
       },
-      "tags": ["innovation", "xr", "education"]
+      "tags": [
+        "innovation",
+        "xr",
+        "education"
+      ],
+      "stages": [
+        {
+          "url": "000-ric.jpg"
+        },
+        {
+          "url": "20261115_e253.jpg"
+        }
+      ],
+      "autoStages": true
     },
     {
       "id": "classroom1",
@@ -74,9 +93,12 @@
         "building": "Commons",
         "room": ""
       },
-      "tags": ["student-life", "public-space"]
+      "tags": [
+        "student-life",
+        "public-space"
+      ]
     },
-     {
+    {
       "id": "classroom2",
       "title": "Classroom 2",
       "folder": "assets/lone-star-college-tomball-classroom2-update",
@@ -93,9 +115,12 @@
         "building": "Commons",
         "room": ""
       },
-      "tags": ["student-life", "public-space"]
+      "tags": [
+        "student-life",
+        "public-space"
+      ]
     },
-     {
+    {
       "id": "scifi-center",
       "title": "SciFi Center",
       "folder": "assets/lone-star-college-tomball-scifi-center",
@@ -112,7 +137,10 @@
         "building": "Commons",
         "room": ""
       },
-      "tags": ["student-life", "public-space"]
+      "tags": [
+        "student-life",
+        "public-space"
+      ]
     },
     {
       "id": "office",
@@ -131,7 +159,10 @@
         "building": "",
         "room": ""
       },
-      "tags": ["home", "workspace"]
+      "tags": [
+        "home",
+        "workspace"
+      ]
     },
     {
       "id": "kitchen",
@@ -150,7 +181,9 @@
         "building": "",
         "room": ""
       },
-      "tags": ["remodel"]
+      "tags": [
+        "remodel"
+      ]
     },
     {
       "id": "xr-lab",
@@ -161,7 +194,7 @@
       "meta": {
         "location": "XR Lab",
         "phase": "Planning",
-        "updated": "2025-10-05",
+        "updated": "2026-11-15",
         "description": "Spatial computing classroom with dedicated VR/AR workstations and flexible collaboration areas."
       },
       "campus": {
@@ -169,11 +202,27 @@
         "building": "E Building",
         "room": "E251"
       },
-      "tags": ["xr", "lab", "education"]
+      "tags": [
+        "xr",
+        "lab",
+        "education"
+      ],
+      "stages": [
+        {
+          "url": "000-xr-lab.jpg"
+        },
+        {
+          "url": "001-xr-lab.jpg"
+        },
+        {
+          "url": "20261115_e251.jpg"
+        }
+      ],
+      "autoStages": true
     },
     {
       "id": "deck",
-      "title": "deck",
+      "title": "Deck",
       "folder": "assets/deck",
       "slug": "deck",
       "thumb": "assets/deck/000-deck.jpg",
@@ -188,11 +237,14 @@
         "building": "",
         "room": ""
       },
-      "tags": ["outdoor", "lighting"]
+      "tags": [
+        "outdoor",
+        "lighting"
+      ]
     },
     {
       "id": "backyard",
-      "title": "backyard",
+      "title": "Backyard",
       "folder": "assets/backyard",
       "slug": "backyard",
       "thumb": "assets/backyard/000-backyard.jpg",
@@ -207,7 +259,37 @@
         "building": "",
         "room": ""
       },
-      "tags": ["landscaping", "patio"]
+      "tags": [
+        "landscaping",
+        "patio"
+      ]
+    },
+    {
+      "id": "c210",
+      "title": "C210",
+      "folder": "assets/lonestar-college-tomball-c210",
+      "slug": "c210",
+      "meta": {
+        "location": "",
+        "phase": "",
+        "updated": "2026-11-15",
+        "description": ""
+      },
+      "campus": {
+        "campus": "Lone Star College – Tomball",
+        "building": "",
+        "room": "C210"
+      },
+      "tags": [],
+      "stages": [
+        {
+          "url": "20260216_C210.jpg"
+        },
+        {
+          "url": "20261115_C210.jpg"
+        }
+      ],
+      "autoStages": true
     }
   ]
 }

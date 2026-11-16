@@ -2,147 +2,231 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#070c16" />
+  <meta name="description" content="Explore before and after 360° panoramas of spaces and projects — on the web, your phone, or in VR." />
   <title>Progress360</title>
   <link rel="stylesheet" href="./styles.css" />
-  <!-- Map bare specifiers used by three.js examples to CDN URLs -->
+  <!-- three.js examples import the bare specifier "three"; map it (and the addons) to the CDN -->
   <script type="importmap">
   {
     "imports": {
       "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
-      "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/",
       "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
     }
   }
   </script>
 </head>
 <body>
-<header class="site-header">
-<div class="brand">
-<div class="logo-ring" aria-hidden="true"></div>
-<h1>Progress<span class="accent">360</span></h1>
-</div>
-<nav class="tagline">Before &bull; After &bull; 360&deg;</nav>
-</header>
+  <!-- Shared icon sprite -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></symbol>
+      <symbol id="i-prev" viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></symbol>
+      <symbol id="i-next" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></symbol>
+      <symbol id="i-expand" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/></symbol>
+      <symbol id="i-shrink" viewBox="0 0 24 24"><path d="M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3"/></symbol>
+      <symbol id="i-center" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></symbol>
+      <symbol id="i-sound" viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/></symbol>
+      <symbol id="i-mute" viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M22 9l-6 6M16 9l6 6"/></symbol>
+      <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></symbol>
+      <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11z"/><circle cx="12" cy="10" r="2.5"/></symbol>
+      <symbol id="i-auto" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></symbol>
+      <symbol id="i-compare" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M12 3v18"/></symbol>
+      <symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z"/></symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+      <symbol id="i-drag" viewBox="0 0 24 24"><path d="M5 9l-3 3 3 3M19 9l3 3-3 3M2 12h20"/></symbol>
+    </defs>
+  </svg>
 
+  <header class="site-header">
+    <a class="brand" href="./" aria-label="Progress360 home">
+      <span class="logo-ring" aria-hidden="true"></span>
+      <span class="brand-name">Progress<span class="accent">360</span></span>
+    </a>
+    <span class="tagline">Before · After · 360°</span>
+  </header>
 
-<main>
-<section class="intro">
-<p>Explore spaces and projects in immersive 360&deg;. Select a project to view <strong>before</strong> and <strong>after</strong> panoramas on the web, your phone, or in VR (WebXR supported).</p>
-</section>
+  <main class="page">
+    <section class="hero">
+      <h1>Every stage of a project, in 360°.</h1>
+      <p>Pick a project to step inside its <strong>before</strong> and <strong>after</strong> panoramas, then scrub the timeline to watch the space change. Works in the browser, on your phone, and in VR headsets that support WebXR.</p>
+    </section>
 
-
-<section class="gallery" id="gallery"></section>
-</main>
-
-
-<!-- Viewer Modal -->
-<div id="viewerModal" class="modal" aria-hidden="true">
-<div class="modal-inner">
-<div class="viewer-header">
-  <div class="viewer-title">
-    <span id="viewerProjectTitle">Project</span>
-    <span id="viewerStatus" class="status">Loading…</span>
-  </div>
-  <div class="viewer-tip">Tip: Drag to look around • Press the VR button to enter immersive mode on supported devices.</div>
-  <button id="closeViewer" class="btn ghost" aria-label="Close">✕</button>
-  </div>
-
-
-<div class="viewer-grid">
-  <!-- Left: Stage gallery in its own card -->
-  <aside class="panel card-panel left-panel">
-    <h3 class="panel-title">Gallery</h3>
-    <div id="sideGallery" class="side-gallery"></div>
-  </aside>
-
-  <!-- Center: 360 image in its own card -->
-  <section class="panel card-panel center-panel">
-    <div id="viewerCanvasWrap" class="viewer-canvas-wrap"><!-- canvas here --></div>
-  </section>
-
-  <!-- Right: Rail stacking info, actions, adjustments -->
-  <div class="right-rail">
-    <aside class="panel card-panel right-info">
-      <h3 class="panel-title">Info</h3>
-      <div class="info-panel">
-        <div class="info-row"><span class="k">Project</span><span id="infoProjectTitle" class="v">-</span></div>
-        <div class="info-block">
-          <div class="info-block-title">About</div>
-          <div id="infoDesc" class="info-desc">No description available.</div>
-        </div>
-        <hr class="info-sep" />
-        <div class="info-row"><span class="k">Stage</span><span id="infoStage" class="v">-</span></div>
-        <div class="info-row"><span class="k">Taken</span><span id="infoTaken" class="v">-</span></div>
-        <div class="info-row"><span class="k">Location</span><span id="infoLocation" class="v">-</span></div>
-        <div class="info-row"><span class="k">Stages</span><span id="infoStages" class="v">-</span></div>
-        <div class="info-row"><span class="k">Media</span><span id="infoMedia" class="v">-</span></div>
-        <div class="info-row"><span class="k">Audio</span><span id="infoAudio" class="v">-</span></div>
-      </div>
-    </aside>
-
-    <aside class="panel card-panel right-actions">
-      <h3 class="panel-title">Actions</h3>
-      <div class="controls">
-        <div class="control-group row">
-          <button id="fullscreenBtn" class="btn ghost">Full Screen</button>
-          <button id="recenterBtn" class="btn ghost">Recenter View</button>
-          <button id="audioBtn" class="btn ghost">Audio Off</button>
-        </div>
-      </div>
-    </aside>
-
-    <aside class="panel card-panel right-panel">
-      <h3 class="panel-title">Adjustments</h3>
-      <div class="controls">
-        <div class="control-group">
-          <label for="exposureRange">Exposure</label>
-          <input id="exposureRange" type="range" min="0.5" max="2" step="0.01" value="1" />
-          <div class="legend"><span>Darker</span><span>Brighter</span></div>
-        </div>
-        <div class="control-group">
-          <label for="gammaRange">Gamma</label>
-          <input id="gammaRange" type="range" min="0.5" max="2" step="0.01" value="1" />
-          <div class="legend"><span>Darker</span><span>Brighter</span></div>
-        </div>
-        <div class="control-group row">
-          <button id="autoAdjustBtn" class="btn">Auto Adjust</button>
-          <button id="resetAdjustBtn" class="btn ghost">Reset</button>
-        </div>
-      </div>
-    </aside>
-  </div>
-
-  <!-- Bottom: Navigation in its own card -->
-  <div class="panel card-panel nav-panel">
-    <div class="nav-section">
-      <label for="timelineRange">Timeline</label>
-      <input id="timelineRange" type="range" min="0" max="1" step="0.001" value="0" />
-      <div id="timelineTicks" class="ticks"></div>
-      <div id="timelineLegend" class="legend"></div>
+    <div class="toolbar">
+      <label class="search">
+        <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+        <input id="searchInput" type="search" placeholder="Search projects, places, tags…" aria-label="Search projects" autocomplete="off" />
+      </label>
+      <div id="phaseFilters" class="chips" role="group" aria-label="Filter by phase"></div>
     </div>
-    <div class="btn-row">
-      <button id="prevBtn" class="btn ghost">Prev</button>
-      <button id="nextBtn" class="btn">Next</button>
+
+    <p id="resultCount" class="result-count" aria-live="polite"></p>
+    <section id="gallery" class="gallery" aria-label="Projects"></section>
+    <p id="emptyState" class="empty" hidden></p>
+  </main>
+
+  <footer class="site-footer">
+    <span>Progress360</span>
+    <span>Drag to look around · ← → to change stage · F for full screen</span>
+  </footer>
+
+  <!-- Viewer -->
+  <div id="viewerModal" class="viewer" role="dialog" aria-modal="true" aria-labelledby="viewerProjectTitle" aria-hidden="true" inert>
+    <header class="viewer-bar">
+      <button id="closeViewer" class="icon-btn" type="button" title="Back to projects (Esc)" aria-label="Back to projects">
+        <svg class="icon" aria-hidden="true"><use href="#i-back"/></svg>
+      </button>
+      <div class="viewer-heading">
+        <h2 id="viewerProjectTitle">Project</h2>
+        <div class="viewer-sub">
+          <span id="viewerStageLabel"></span>
+          <span id="viewerStatus" class="status" aria-live="polite">Loading…</span>
+        </div>
+      </div>
+      <div class="viewer-actions">
+        <button id="audioBtn" class="icon-btn" type="button" aria-pressed="false" aria-label="Sound" hidden>
+          <svg class="icon when-off" aria-hidden="true"><use href="#i-mute"/></svg>
+          <svg class="icon when-on" aria-hidden="true"><use href="#i-sound"/></svg>
+        </button>
+        <button id="recenterBtn" class="icon-btn" type="button" title="Recenter view (R)" aria-label="Recenter view">
+          <svg class="icon" aria-hidden="true"><use href="#i-center"/></svg>
+        </button>
+        <button id="fullscreenBtn" class="icon-btn" type="button" title="Full screen (F)" aria-label="Full screen" aria-pressed="false">
+          <svg class="icon when-off" aria-hidden="true"><use href="#i-expand"/></svg>
+          <svg class="icon when-on" aria-hidden="true"><use href="#i-shrink"/></svg>
+        </button>
+        <button id="sidebarBtn" class="icon-btn" type="button" title="Details &amp; adjustments (I)" aria-label="Details and adjustments" aria-controls="viewerSidebar" aria-expanded="true">
+          <svg class="icon" aria-hidden="true"><use href="#i-panel"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="viewer-body">
+      <section id="stageArea" class="stage-area" aria-label="360° view">
+        <div id="viewerCanvasWrap" class="viewer-canvas-wrap">
+          <div id="loadingOverlay" class="loading-overlay">
+            <div class="spinner" aria-hidden="true"></div>
+            <div id="loadingText" class="loading-text">Loading…</div>
+          </div>
+          <div id="dragHint" class="drag-hint" hidden>
+            <svg class="icon" aria-hidden="true"><use href="#i-drag"/></svg>
+            Drag to look around · scroll or pinch to zoom
+          </div>
+        </div>
+
+        <nav class="timeline" aria-label="Project stages">
+          <button id="playBtn" class="icon-btn play-btn" type="button" title="Play through stages (Space)" aria-label="Play through stages" aria-pressed="false">
+            <svg class="icon when-off" aria-hidden="true"><use href="#i-play"/></svg>
+            <svg class="icon when-on" aria-hidden="true"><use href="#i-pause"/></svg>
+          </button>
+          <button id="prevBtn" class="icon-btn" type="button" title="Previous stage (←)" aria-label="Previous stage">
+            <svg class="icon" aria-hidden="true"><use href="#i-prev"/></svg>
+          </button>
+          <div class="timeline-track">
+            <input id="timelineRange" class="timeline-range" type="range" min="0" max="1" step="any" value="0" aria-label="Blend between stages" />
+            <div id="filmstrip" class="filmstrip"></div>
+          </div>
+          <button id="nextBtn" class="icon-btn" type="button" title="Next stage (→)" aria-label="Next stage">
+            <svg class="icon" aria-hidden="true"><use href="#i-next"/></svg>
+          </button>
+        </nav>
+      </section>
+
+      <aside id="viewerSidebar" class="sidebar" aria-label="Project details">
+        <div class="sidebar-head">
+          <span>Details</span>
+          <button id="sidebarCloseBtn" class="icon-btn small" type="button" aria-label="Close details">
+            <svg class="icon" aria-hidden="true"><use href="#i-close"/></svg>
+          </button>
+        </div>
+
+        <section class="panel">
+          <h3>About</h3>
+          <p id="infoDesc" class="info-desc">No description yet.</p>
+          <div id="infoTags" class="tags" hidden></div>
+        </section>
+
+        <section class="panel">
+          <h3>Details</h3>
+          <dl class="details">
+            <div><dt>Stage</dt><dd id="infoStage">—</dd></div>
+            <div><dt>Captured</dt><dd id="infoTaken">—</dd></div>
+            <div><dt>Location</dt><dd id="infoLocation">—</dd></div>
+            <div><dt>Site</dt><dd id="infoPlace">—</dd></div>
+            <div><dt>Phase</dt><dd id="infoPhase">—</dd></div>
+            <div><dt>Updated</dt><dd id="infoUpdated">—</dd></div>
+            <div><dt>Media</dt><dd id="infoMedia">—</dd></div>
+          </dl>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h3>Adjustments</h3>
+            <span id="adjState" class="pill">Original</span>
+          </div>
+          <div class="sliders">
+            <div class="slider">
+              <div class="slider-head"><label for="adj-exposure">Exposure</label><output id="adj-exposure-val" for="adj-exposure">0.00 EV</output></div>
+              <input id="adj-exposure" type="range" min="-2" max="2" step="0.05" value="0" />
+            </div>
+            <div class="slider">
+              <div class="slider-head"><label for="adj-contrast">Contrast</label><output id="adj-contrast-val" for="adj-contrast">0</output></div>
+              <input id="adj-contrast" type="range" min="-50" max="50" step="1" value="0" />
+            </div>
+            <div class="slider">
+              <div class="slider-head"><label for="adj-midtones">Midtones</label><output id="adj-midtones-val" for="adj-midtones">0</output></div>
+              <input id="adj-midtones" type="range" min="-50" max="50" step="1" value="0" />
+            </div>
+            <div class="slider">
+              <div class="slider-head"><label for="adj-saturation">Saturation</label><output id="adj-saturation-val" for="adj-saturation">0</output></div>
+              <input id="adj-saturation" type="range" min="-100" max="100" step="1" value="0" />
+            </div>
+          </div>
+          <div class="btn-row">
+            <button id="autoAdjustBtn" class="btn" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#i-auto"/></svg> Auto
+            </button>
+            <button id="compareBtn" class="btn ghost" type="button" title="Hold to see the original (C)">
+              <svg class="icon" aria-hidden="true"><use href="#i-compare"/></svg> Hold to compare
+            </button>
+            <button id="resetAdjustBtn" class="btn ghost" type="button" title="Reset to original">
+              <svg class="icon" aria-hidden="true"><use href="#i-reset"/></svg> Reset
+            </button>
+          </div>
+          <p class="hint">Applied to every stage so before and after stay comparable. Images start exactly as captured. Double-click a slider to reset it.</p>
+        </section>
+
+        <section class="panel shortcuts">
+          <h3>Shortcuts</h3>
+          <ul>
+            <li><kbd>←</kbd><kbd>→</kbd> Change stage</li>
+            <li><kbd>Space</kbd> Play / pause</li>
+            <li><kbd>F</kbd> Full screen</li>
+            <li><kbd>R</kbd> Recenter</li>
+            <li><kbd>+</kbd><kbd>−</kbd> Zoom</li>
+            <li><kbd>C</kbd> Hold to compare</li>
+            <li><kbd>I</kbd> Toggle details</li>
+            <li><kbd>M</kbd> Sound</li>
+            <li><kbd>Esc</kbd> Back</li>
+          </ul>
+        </section>
+      </aside>
     </div>
   </div>
-</div>
-</div>
-<div class="modal-backdrop"></div>
-</div>
 
+  <div id="toastHost" class="toast-host" aria-live="polite"></div>
 
-<!-- Toasts -->
-<div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="true"></div>
-
-
-<script type="module" src="./main.js"></script>
-<script>
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', function(){
-      navigator.serviceWorker.register('./sw.js').catch(function(){ /* ignore */ });
-    });
-  }
-</script>
+  <script type="module" src="./main.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('./sw.js').catch(function () {});
+      });
+    }
+  </script>
 </body>
 </html>

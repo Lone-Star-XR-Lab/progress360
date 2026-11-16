@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // Generate small JPEG thumbnails for project folders under assets/
-// Looks for 000-<slug>.jpg and writes 000-<slug>-thumb.jpg if missing.
+// Uses the project's first stage image (000-<slug>.jpg, or the oldest dated image such as
+// 20260216_C210.jpg) and writes <name>-thumb.jpg next to it if missing.
 
 import fs from 'fs/promises';
 import path from 'path';
 import url from 'url';
+import { sortStageFiles } from '../stages.js';
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
@@ -23,10 +25,6 @@ try{
   process.exit(1);
 }
 
-function isDirEntProjectFolder(de){
-  return de.isDirectory() && !de.name.startsWith('.') && de.name !== 'deck' ? true : de.isDirectory();
-}
-
 async function listDirs(root){
   const out = [];
   const entries = await fs.readdir(root, { withFileTypes: true });
@@ -37,21 +35,14 @@ async function listDirs(root){
 }
 
 async function findBaseImage(dir){
-  const files = await fs.readdir(dir);
-  // Prefer 000-*.jpg
-  const primary = files.find(f=> /^000-.*\.jpg$/i.test(f));
-  if(primary) return path.join(dir, primary);
-  // fallback: any jpg
-  const any = files.find(f=> /\.jpg$/i.test(f));
-  if(any) return path.join(dir, any);
-  return null;
+  // Same ordering the viewer uses (stages.js); *-thumb.jpg files are excluded there
+  const first = sortStageFiles(await fs.readdir(dir)).find(f=> /\.jpe?g$/i.test(f));
+  return first ? path.join(dir, first) : null;
 }
 
+// 000-kitchen.jpg → 000-kitchen-thumb.jpg, 20260216_C210.jpg → 20260216_C210-thumb.jpg
 function computeThumbName(basePath){
-  const bn = path.basename(basePath);
-  const m = bn.match(/^000-([^.]+)\.jpg$/i);
-  const slug = m ? m[1] : bn.replace(/\.jpg$/i, '').replace(/^000-/, '');
-  return path.join(path.dirname(basePath), `000-${slug}-thumb.jpg`);
+  return basePath.replace(/\.jpe?g$/i, '-thumb.jpg');
 }
 
 async function ensureThumbFor(dir){

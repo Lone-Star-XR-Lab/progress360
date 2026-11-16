@@ -1,1247 +1,1182 @@
-import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js';
-import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/controls/OrbitControls.js';
-import { VRButton } from 'https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/webxr/VRButton.js';
+// Progress360 viewer
+// Renders a project's stages (equirectangular images or videos) on the inside of a sphere,
+// cross-fades between stages, and exposes non-destructive colour adjustments.
+//
+// Colour pipeline (see docs/viewer.md):
+//   texture (sRGB, decoded to linear by the GPU) -> stage cross-fade (linear)
+//   -> exposure (linear, in EV stops) -> midtones / contrast / saturation (display space)
+//   -> three.js output encoding (back to sRGB for the canvas / XR layer).
+// With every adjustment at its default the image on screen is pixel-for-pixel the source file.
 
-// Internal state
-let renderer, scene, camera, controls, sphere, material;
-let modalEl, container, titleEl, statusEl,
-    timelineRange, timelineLegend,
-    timelineTicks,
-    exposureRange, gammaRange, autoAdjustBtn, resetAdjustBtn,
-    prevBtn, nextBtn, recenterBtn, closeBtn, fullscreenBtn, audioBtn, sideGallery;
-let toggleLeftBtn, toggleRightBtn, viewerGridEl, centerPanelEl;
-// no header-based restore; use in-card chevrons and slim handles
-let infoStageEl, infoTakenEl, infoLocationEl, infoProjectTitleEl, infoStagesEl, infoMediaEl, infoDescEl, infoAudioEl;
-let mixUniform;
-let currentProject = null;
-let stages = [];
-let stageTextures = [];
-let stageVideos = [];
-let stagePos = 0; // float 0..(stages.length-1)
-let fsOverlay;
-let fsIndicatorEl;
-let currentStageIndex = 0;
-// relative view carry-over disabled (fronts removed)
-let toastHost;
-let audioEnabled = false;
-let _blockZoomHandlers = [];
-let loadingOverlayEl;
-let _progressLoaded = 0;
-let _progressTotal = 0;
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
 
-// Per-stage orientation (persisted)
-// Store angles instead of quaternions for OrbitControls
-// orients[index] -> [theta, phi]
-let stageOrients = {};
-// Per-stage adjustments (persisted)
-let exposureByStage = {};
-let gammaByStage = {};
+const VIDEO_RE = /\.(mp4|webm|ogv|mov)(\?|#|$)/i;
+const JPEG_RE = /\.jpe?g(\?|#|$)/i;
+const isVideoUrl = (u)=> VIDEO_RE.test(u || '');
 
-// Keep chevrons and aria/text in sync with collapse state
-function syncCollapseUI(){
-  const g = viewerGridEl || modalEl?.querySelector?.('.viewer-grid');
-  const leftOn = g?.classList?.contains('collapse-left');
-  const rightOn = g?.classList?.contains('collapse-right');
-  if(toggleLeftBtn){
-    toggleLeftBtn.setAttribute('aria-pressed', leftOn ? 'true':'false');
-    toggleLeftBtn.textContent = leftOn ? '›' : '‹';
-    toggleLeftBtn.title = leftOn ? 'Show Gallery' : 'Hide Gallery';
-  }
-  if(toggleRightBtn){
-    toggleRightBtn.setAttribute('aria-pressed', rightOn ? 'true':'false');
-    toggleRightBtn.textContent = rightOn ? '‹' : '›';
-    toggleRightBtn.title = rightOn ? 'Show Tools' : 'Hide Tools';
-  }
-}
-// Local persistence (per project)
-const STORE_PREFIX = 'p360:proj:';
-function storeKey(){ return `${STORE_PREFIX}${currentProject?.id || 'unknown'}`; }
-function loadSettings(){
-  try { return JSON.parse(localStorage.getItem(storeKey()) || '{}'); }
+const STORE_PREFIX = 'p360:v2:';            // v2: old (pre colour-fix) settings are ignored
+const DEFAULT_FOV = 75;
+const MIN_FOV = 30;
+const MAX_FOV = 100;
+const TWEEN_MS = 450;          // manual stage change (‹ › / filmstrip / keys)
+const PLAY_FADE_MS = 4000;     // cross-fade length while playing (slow dissolve)
+const PLAY_HOLD_MS = 3000;     // how long each stage is held while playing
+
+const signed = (v)=> `${v > 0 ? '+' : ''}${Math.round(v)}`;
+export const ADJUSTMENTS = {
+  exposure:   { label: 'Exposure',   min: -2,   max: 2,   step: 0.05, fmt: (v)=> `${v > 0 ? '+' : ''}${v.toFixed(2)} EV` },
+  contrast:   { label: 'Contrast',   min: -50,  max: 50,  step: 1,    fmt: signed },
+  midtones:   { label: 'Midtones',   min: -50,  max: 50,  step: 1,    fmt: signed },
+  saturation: { label: 'Saturation', min: -100, max: 100, step: 1,    fmt: signed },
+};
+const DEFAULT_ADJ = { exposure: 0, contrast: 0, midtones: 0, saturation: 0 };
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+const ui = {};
+let bound = false;
+let renderer, scene, camera, controls, material;
+let onRequestClose = null;
+let lastFocus = null;
+let saveTimer = 0;
+let hintTimer = 0;
+
+const state = {
+  open: false,
+  token: 0,              // increments per project load; stale async work checks it
+  project: null,
+  stages: [],
+  textures: [],
+  videos: [],
+  failed: [],
+  loaded: 0,
+  pos: 0,                // float 0..stages.length-1
+  index: 0,              // floor(pos)
+  tween: null,           // { from, to, start, dur }
+  playing: false,        // auto-advancing through stages
+  nextAt: 0,             // performance.now() time of the next auto-advance
+  adj: { ...DEFAULT_ADJ },
+  comparing: false,
+  audio: false,
+  sidebarOpen: true,
+};
+
+const narrowMQ = window.matchMedia('(max-width: 960px)');
+const clamp = (v, lo, hi)=> Math.min(hi, Math.max(lo, v));
+
+/** Let the host page decide what "close" means (e.g. clear the URL hash). */
+export function setCloseHandler(fn){ onRequestClose = typeof fn === 'function' ? fn : null; }
+function requestClose(){ (onRequestClose || closeViewer)(); }
+
+// ---------------------------------------------------------------------------
+// Persistence (per project, browser-local)
+// ---------------------------------------------------------------------------
+function storeKey(id){ return `${STORE_PREFIX}${id || 'unknown'}`; }
+function loadSettings(id){
+  try { return JSON.parse(localStorage.getItem(storeKey(id)) || '{}') || {}; }
   catch { return {}; }
 }
-function saveSettings(partial){
-  try {
-    const prev = loadSettings();
-    const next = { ...prev };
-    for(const k of Object.keys(partial)){
-      if(typeof partial[k] === 'object' && partial[k] && !Array.isArray(partial[k])){
-        next[k] = { ...(prev[k]||{}), ...(partial[k]||{}) };
-      }else{
-        next[k] = partial[k];
-      }
-    }
-    localStorage.setItem(storeKey(), JSON.stringify(next));
-  } catch {}
+function saveSoon(){
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveNow, 300);
 }
-
-function ensureUIRefs(){
-  // Always (re)bind to current DOM; do not early-return
-  modalEl = document.getElementById('viewerModal');
-  container = document.getElementById('viewerCanvasWrap');
-  titleEl = document.getElementById('viewerProjectTitle');
-  statusEl = document.getElementById('viewerStatus');
-  timelineRange = document.getElementById('timelineRange');
-  timelineLegend = document.getElementById('timelineLegend');
-  timelineTicks = document.getElementById('timelineTicks');
-  exposureRange = document.getElementById('exposureRange');
-  gammaRange = document.getElementById('gammaRange');
-  autoAdjustBtn = document.getElementById('autoAdjustBtn');
-  resetAdjustBtn = document.getElementById('resetAdjustBtn');
-  prevBtn = document.getElementById('prevBtn');
-  nextBtn = document.getElementById('nextBtn');
-  recenterBtn = document.getElementById('recenterBtn');
-  fullscreenBtn = document.getElementById('fullscreenBtn');
-  closeBtn = document.getElementById('closeViewer');
-  audioBtn = document.getElementById('audioBtn');
-  sideGallery = document.getElementById('sideGallery');
-  infoStageEl = document.getElementById('infoStage');
-  infoTakenEl = document.getElementById('infoTaken');
-  infoLocationEl = document.getElementById('infoLocation');
-  infoProjectTitleEl = document.getElementById('infoProjectTitle');
-  infoStagesEl = document.getElementById('infoStages');
-  infoMediaEl = document.getElementById('infoMedia');
-  infoDescEl = document.getElementById('infoDesc');
-  infoAudioEl = document.getElementById('infoAudio');
-  toastHost = document.getElementById('toastHost');
-
-  // Landscape collapsible controls (header actions, not over image)
-  viewerGridEl = modalEl?.querySelector('.viewer-grid') || null;
-  centerPanelEl = modalEl?.querySelector('.center-panel') || null;
-  // Remove any legacy edge overlay toggles if present
-  try{ centerPanelEl?.querySelectorAll?.('.edge-toggle')?.forEach(el=> el.remove()); }catch{}
-  // Create in-card toggles
-  const leftPanel = modalEl?.querySelector('.left-panel');
-  const leftTitle = leftPanel?.querySelector('.panel-title');
-  if(leftTitle){
-    // Normalize header content: [spacer][label centered][chevron at right]
-    leftTitle.classList.add('chev-right');
-    // Ensure label + single spacer exist
-    let label = leftTitle.querySelector('.panel-label');
-    if(!label){
-      const text = (leftTitle.textContent || '').trim() || 'Gallery';
-      leftTitle.textContent = '';
-      const spacer = document.createElement('span');
-      spacer.className = 'panel-spacer';
-      leftTitle.appendChild(spacer);
-      label = document.createElement('span');
-      label.className = 'panel-label';
-      label.textContent = text;
-      leftTitle.appendChild(label);
-    }else{
-      // If two spacers exist from previous runs, keep only one
-      const spacers = leftTitle.querySelectorAll('.panel-spacer');
-      if(spacers.length > 1){ spacers.forEach((s,i)=>{ if(i>0) s.remove(); }); }
-      if(spacers.length === 0){ const sp = document.createElement('span'); sp.className='panel-spacer'; leftTitle.insertBefore(sp, label); }
-    }
-    toggleLeftBtn = leftTitle.querySelector('#toggleLeftBtn');
-    if(!toggleLeftBtn){
-      toggleLeftBtn = document.createElement('button');
-      toggleLeftBtn.id = 'toggleLeftBtn';
-      toggleLeftBtn.type = 'button';
-      toggleLeftBtn.className = 'btn ghost toggle-btn';
-      toggleLeftBtn.setAttribute('aria-pressed','false');
-      leftTitle.appendChild(toggleLeftBtn);
-    }
-  }
-
-  const rightRail = modalEl?.querySelector('.right-rail');
-  // Remove legacy right-toggle card if it exists
-  try{ rightRail?.querySelectorAll?.('.right-toggle')?.forEach(el=> el.remove()); }catch{}
-  // Build a Tools header card and a tools-content container; move existing panels inside
-  if(rightRail){
-    let toolsHeader = rightRail.querySelector('.right-tools');
-    if(!toolsHeader){
-      toolsHeader = document.createElement('aside');
-      toolsHeader.className = 'panel card-panel right-tools';
-      const h = document.createElement('h3');
-      h.className = 'panel-title chev-left';
-      // label + spacer (chevron inserted first below)
-      const label = document.createElement('span'); label.className = 'panel-label'; label.textContent = 'Tools';
-      const spacer = document.createElement('span'); spacer.className = 'panel-spacer';
-      h.appendChild(label);
-      h.appendChild(spacer);
-      toolsHeader.appendChild(h);
-      rightRail.insertBefore(toolsHeader, rightRail.firstChild);
-    }else{
-      const h = toolsHeader.querySelector('.panel-title');
-      if(h) h.classList.add('chev-left');
-      if(h && !h.querySelector('.panel-label')){
-        const label = document.createElement('span'); label.className='panel-label'; label.textContent='Tools';
-        const spacer = document.createElement('span'); spacer.className='panel-spacer';
-        h.appendChild(label); h.appendChild(spacer);
-      }
-    }
-    // Insert chevron button
-    const h2 = toolsHeader.querySelector('.panel-title');
-    toggleRightBtn = toolsHeader.querySelector('#toggleRightBtn');
-    if(!toggleRightBtn){
-      toggleRightBtn = document.createElement('button');
-      toggleRightBtn.id = 'toggleRightBtn';
-      toggleRightBtn.type = 'button';
-      toggleRightBtn.className = 'btn ghost toggle-btn';
-      toggleRightBtn.setAttribute('aria-pressed','false');
-      h2?.insertBefore(toggleRightBtn, h2.firstChild);
-    }
-    // Create tools-content card and move panels inside
-    let toolsContent = rightRail.querySelector('.tools-content');
-    if(!toolsContent){
-      toolsContent = document.createElement('aside');
-      toolsContent.className = 'panel card-panel tools-content';
-      // move existing info/actions/adjustments cards into tools-content
-      const info = rightRail.querySelector('.right-info');
-      const actions = rightRail.querySelector('.right-actions');
-      const adjust = rightRail.querySelector('.right-panel');
-      if(info) toolsContent.appendChild(info);
-      if(actions) toolsContent.appendChild(actions);
-      if(adjust) toolsContent.appendChild(adjust);
-      rightRail.appendChild(toolsContent);
-    }
-  }
-
-  // No header restore buttons per design
-
-  // Ensure a lightweight loading overlay exists over the canvas area
-  try{
-    if(container && !loadingOverlayEl){
-      loadingOverlayEl = document.createElement('div');
-      loadingOverlayEl.className = 'loading-overlay';
-      loadingOverlayEl.innerHTML = '<div class="spinner"></div><div class="loading-text">Loading…</div>';
-      container.appendChild(loadingOverlayEl);
-      loadingOverlayEl.style.display = 'none';
-    }
-  }catch{}
-
-  if(!modalEl || !container) throw new Error('Viewer UI elements not found');
-
-  closeBtn?.addEventListener('click', closeViewer);
-  timelineRange?.addEventListener('input', (e)=> setStagePos(parseFloat(e.target.value)) );
-  // Snap to nearest stage when releasing the thumb
-  timelineRange?.addEventListener('change', (e)=> setStagePos(Math.round(parseFloat(e.target.value))) );
-  prevBtn?.addEventListener('click', ()=> nudgeStage(-1));
-  nextBtn?.addEventListener('click', ()=> nudgeStage(+1));
-  fullscreenBtn?.addEventListener('click', toggleFullscreen);
-  exposureRange?.addEventListener('input', (e)=> setExposure(parseFloat(e.target.value)) );
-  gammaRange?.addEventListener('input', (e)=> setGamma(parseFloat(e.target.value)) );
-  autoAdjustBtn?.addEventListener('click', ()=> autoAdjust());
-  resetAdjustBtn?.addEventListener('click', ()=> { setExposure(1.0); setGamma(1.1); });
-  recenterBtn?.addEventListener('click', ()=> recenterToStageFront());
-  audioBtn?.addEventListener('click', ()=> setAudioEnabled(!audioEnabled));
-  // Reflect audio state styling
-  if(audioBtn){ audioBtn.classList.toggle('active', !!audioEnabled); }
-
-  // Collapse/expand handlers
-  const grid = ()=> (viewerGridEl || modalEl?.querySelector('.viewer-grid'));
-  toggleLeftBtn?.addEventListener('click', ()=>{ const g = grid(); if(!g) return; g.classList.toggle('collapse-left'); syncCollapseUI(); setTimeout(onResize,0); });
-  toggleRightBtn?.addEventListener('click', ()=>{ const g = grid(); if(!g) return; g.classList.toggle('collapse-right'); syncCollapseUI(); setTimeout(onResize,0); });
-  // Initial sync now that buttons exist
-  syncCollapseUI();
-}
-
-// Toasts
-function showToast(message, type = 'info', timeoutMs = 2600){
-  if(!toastHost){ toastHost = document.getElementById('toastHost'); }
-  if(!toastHost) return;
-  const el = document.createElement('div');
-  el.className = `toast ${type} toast-enter`;
-  el.textContent = message;
-  toastHost.appendChild(el);
-  setTimeout(()=>{
-    el.classList.remove('toast-enter');
-    el.classList.add('toast-exit');
-    setTimeout(()=> el.remove(), 200);
-  }, timeoutMs);
-}
-
-function setAudioEnabled(flag){
-  audioEnabled = !!flag;
-  if(audioBtn){
-    audioBtn.textContent = audioEnabled ? 'Audio On' : 'Audio Off';
-    audioBtn.classList.toggle('active', audioEnabled);
-  }
-  // update overlay button label if present
-  if(fsOverlay){
-    const ab = fsOverlay.querySelector('button[data-action="audio"]');
-    if(ab) ab.textContent = audioEnabled ? 'Audio On' : 'Audio Off';
-  }
-  // Apply to current stage
-  applyAudioForCurrent();
-  showToast(audioEnabled ? 'Audio enabled' : 'Audio muted', 'info');
-  // Update info panel status if visible
-  try{ updateInfoPanel(); }catch{}
-}
-
-function applyAudioForCurrent(){
-  if(!stageVideos || !stageVideos.length) return;
-  // Mute all, then unmute current if enabled
-  for(const v of stageVideos){ try{ if(v) v.muted = true; }catch{} }
-  const v = stageVideos[currentStageIndex];
-  if(audioEnabled && v){
-    try{ v.muted = false; safePlay(v); }catch{}
-  }
-}
-
-function safePlay(video){
-  if(!video || typeof video.play !== 'function') return;
-  // Defer to avoid immediate pause->play race
-  setTimeout(()=>{
-    try{
-      const p = video.play();
-      if(p && typeof p.catch === 'function') p.catch(()=>{});
-    }catch{}
-  }, 0);
-}
-
-function setMix(v){ if(mixUniform) mixUniform.value = v; }
-
-function setStagePos(v, persist = true){
-  if(!stages.length) return;
-  const targetPos = Math.min(stages.length-1, Math.max(0, v));
-  if(timelineRange) timelineRange.value = String(targetPos);
-  const newIndex = Math.floor(targetPos);
-  const changedIndex = (newIndex !== currentStageIndex);
-
-  // Compute relative view delta disabled (fronts removed)
-
-  stagePos = targetPos;
-  currentStageIndex = newIndex;
-  const frac = stagePos - newIndex;
-  const texA = getTextureAt(newIndex);
-  const texB = getTextureAt(Math.min(newIndex+1, stageTextures.length-1)) || texA;
-  if(material){
-    material.uniforms.map1.value = texA;
-    material.uniforms.map2.value = texB;
-  }
-  setMix(frac);
-  updateTimelineLegendHighlight(newIndex, frac);
-  if(persist) saveSettings({ stagePos });
-  // Update overlay indicator if visible
-  if(fsOverlay && fsOverlay.style.display !== 'none') updateFsIndicator();
-  updateInfoPanel();
-  // Keep current view on stage change; no auto-rotate
-  if(changedIndex){
-    // Load per-stage adjustments (and auto if missing)
-    applyAdjustmentsForStage(newIndex, true);
-    // Make sure recenter has a baseline orientation for this stage
-    ensureStageOrient(newIndex);
-  }
-  playStageMedia(currentStageIndex);
-}
-
-function getTextureAt(i){
-  if(!stageTextures || !stageTextures.length) return null;
-  if(stageTextures[i]) return stageTextures[i];
-  for(let k=i; k>=0; k--){ if(stageTextures[k]) return stageTextures[k]; }
-  for(let k=i; k<stageTextures.length; k++){ if(stageTextures[k]) return stageTextures[k]; }
-  return stageTextures.find(Boolean) || null;
-}
-
-function playStageMedia(index){
-  if(!stageVideos || !stageVideos.length) return;
-  const keepA = index;
-  const keepB = Math.min(index+1, stageVideos.length-1);
-  // Pause and mute all that aren't active
-  for(let i=0;i<stageVideos.length;i++){
-    const v = stageVideos[i];
-    if(!v) continue;
-    if(i !== keepA && i !== keepB){ try{ v.pause(); v.muted = true; }catch{} }
-  }
-  const v1 = stageVideos[keepA];
-  const v2 = stageVideos[keepB];
-  if(v1) safePlay(v1);
-  if(v2 && v2 !== v1) safePlay(v2);
-  // If audio enabled, unmute only current stage
-  if(audioEnabled && v1){ v1.muted = false; safePlay(v1); }
-}
-
-function nudgeStage(dir){
-  // Use the committed stage index to avoid skipping when slider is between ticks
-  const i = currentStageIndex + dir;
-  setStagePos(i);
-}
-
-function updateTimelineLegend(labels=[]){
-  if(!timelineLegend) return;
-  timelineLegend.innerHTML = '';
-  labels.forEach((lab, idx)=>{
-    const span = document.createElement('span');
-    span.textContent = lab;
-    span.style.cursor = 'pointer';
-    span.addEventListener('click', ()=> setStagePos(idx));
-    timelineLegend.appendChild(span);
-  });
-}
-
-function updateTimelineTicks(count){
-  if(!timelineTicks) return;
-  timelineTicks.innerHTML = '';
-  for(let i=0;i<count;i++){
-    const t = document.createElement('span');
-    t.className = 'tick';
-    t.title = stages[i]?.label || `Stage ${i+1}`;
-    t.addEventListener('click', ()=> setStagePos(i));
-    timelineTicks.appendChild(t);
-  }
-}
-
-function updateTimelineLegendHighlight(i, frac){
-  if(!timelineLegend) return;
-  const children = timelineLegend.children;
-  for(let k=0;k<children.length;k++){
-    children[k].style.opacity = (k===i || (k===i+1 && frac>0)) ? '1' : '0.6';
-  }
-  // gallery highlight
-  if(sideGallery){
-    const thumbs = sideGallery.querySelectorAll('img.thumb');
-    thumbs.forEach((img, idx)=>{
-      img.classList.toggle('active', idx===i || (idx===i+1 && frac>0));
-    });
-  }
-  // ticks highlight
-  if(timelineTicks){
-    const ticks = timelineTicks.querySelectorAll('.tick');
-    ticks.forEach((tick, idx)=>{
-      tick.classList.toggle('active', idx===i || (idx===i+1 && frac>0));
-    });
-  }
-}
-
-function toggleFullscreen(){
-  if(!container) return;
-  const isFS = document.fullscreenElement === container;
-  if(isFS){ document.exitFullscreen?.(); }
-  else{
-    const opts = { navigationUI: 'hide' };
-    try{ container.requestFullscreen?.(opts); }
-    catch{ container.requestFullscreen?.(); }
-  }
-}
-
-document.addEventListener('fullscreenchange', ()=>{
-  if(fullscreenBtn) {
-    fullscreenBtn.textContent = document.fullscreenElement ? 'Exit Full Screen' : 'Full Screen';
-  }
-  onResize();
-  // run again after layout settles
-  setTimeout(onResize, 50);
-  setTimeout(onResize, 200);
-  showFsOverlay(document.fullscreenElement === container || renderer?.xr?.isPresenting === true);
-});
-
-function setupXRControllers(){
-  try{
-    const next = renderer.xr.getController(0);
-    const prev = renderer.xr.getController(1);
-    next.addEventListener('select', ()=> nudgeStage(+1));
-    prev.addEventListener('select', ()=> nudgeStage(-1));
-    next.addEventListener('squeeze', endXRSession);
-    prev.addEventListener('squeeze', endXRSession);
-    scene.add(next); scene.add(prev);
-  }catch{}
-}
-
-function endXRSession(){
-  const s = renderer?.xr?.getSession?.();
-  s?.end?.();
-}
-
-function exitXRorFS(){
-  if(renderer?.xr?.isPresenting){ endXRSession(); return; }
-  if(document.fullscreenElement === container){ document.exitFullscreen?.(); }
-}
-
-function showFsOverlay(show){
-  if(!container) return;
-  if(!fsOverlay){
-    fsOverlay = document.createElement('div');
-    fsOverlay.className = 'fs-overlay';
-    fsOverlay.innerHTML = `
-      <div class="fs-exit">
-        <button class="btn ghost" data-action="audio">Audio Off</button>
-        <button class="btn exit-btn" data-action="exit">Exit Full Screen</button>
-      </div>
-      <div class="fs-nav">
-        <button class="btn big" data-action="prev">Prev</button>
-        <div class="fs-indicator"></div>
-        <button class="btn big" data-action="next">Next</button>
-      </div>
-    `;
-    fsOverlay.addEventListener('click', (e)=>{
-      const b = e.target.closest('button');
-      if(!b) return;
-      const a = b.dataset.action;
-      if(a==='prev') nudgeStage(-1);
-      if(a==='next') nudgeStage(+1);
-      if(a==='audio') setAudioEnabled(!audioEnabled);
-      if(a==='exit') exitXRorFS();
-    });
-    container.appendChild(fsOverlay);
-    fsIndicatorEl = fsOverlay.querySelector('.fs-indicator');
-    const ab = fsOverlay.querySelector('button[data-action="audio"]');
-    if(ab) ab.textContent = audioEnabled ? 'Audio On' : 'Audio Off';
-  }
-  fsOverlay.style.display = show ? 'flex' : 'none';
-  if(show) updateFsIndicator();
-}
-
-function updateFsIndicator(){
-  if(!fsIndicatorEl || !stages.length) return;
-  const i = Math.floor(stagePos);
-  const label = stages[i]?.label || `Stage ${i+1}`;
-  fsIndicatorEl.textContent = `${label} • ${i+1}/${stages.length}`;
-}
-
-// ---------- Info panel (EXIF + project meta) ----------
-const exifCache = new Map(); // url -> { taken, gpsText, gps }
-
-function updateInfoPanel(){
-  if(!stages.length) return;
-  const i = Math.floor(stagePos);
-  const stage = stages[i];
-  if(infoStageEl) infoStageEl.textContent = stage?.label || `Stage ${i+1}`;
-  if(infoProjectTitleEl) infoProjectTitleEl.textContent = currentProject?.title || '-';
-  if(infoStagesEl) infoStagesEl.textContent = `${stages.length}`;
-  if(infoMediaEl){
-    const imgs = stages.filter(s=> /\.jpg(\?|$)/i.test(s.url)).length;
-    const vids = stages.filter(s=> /\.(mp4|webm|ogg)(\?|$)/i.test(s.url)).length;
-    const parts = [];
-    if(imgs) parts.push(`${imgs} image${imgs>1?'s':''}`);
-    if(vids) parts.push(`${vids} video${vids>1?'s':''}`);
-    infoMediaEl.textContent = parts.join(' • ') || '-';
-  }
-  if(infoDescEl){
-    const desc = currentProject?.meta?.description || currentProject?.description || '';
-    infoDescEl.textContent = desc || 'No description available.';
-  }
-  // Audio availability per stage
-  if(infoAudioEl){
-    const isVideo = /\.(mp4|webm|ogg)(\?|$)/i.test(stage?.url||'');
-    const status = isVideo ? (audioEnabled ? 'Available • On' : 'Available • Off') : 'Not available';
-    infoAudioEl.textContent = status;
-  }
-  // Toggle subtle attention pulse on Audio button when stage has audio but is muted
-  try{
-    const isVideo = /\.(mp4|webm|ogg)(\?|$)/i.test(stage?.url||'');
-    if(audioBtn){ audioBtn.classList.toggle('audio-attn', !!isVideo && !audioEnabled); }
-  }catch{}
-  const url = stage?.url;
-  if(!url){
-    if(infoTakenEl) infoTakenEl.textContent = '—';
-    if(infoLocationEl) infoLocationEl.textContent = currentProject?.meta?.location || '—';
-    return;
-  }
-  if(exifCache.has(url)){
-    const { taken, gpsText, gps } = exifCache.get(url);
-    if(infoTakenEl) infoTakenEl.textContent = taken || '—';
-    if(infoLocationEl){
-      if(gps && Number.isFinite(gps.lat) && Number.isFinite(gps.lon)){
-        infoLocationEl.innerHTML = `<a href="https://www.google.com/maps?q=${gps.lat},${gps.lon}" target="_blank" rel="noopener">${gpsText}</a>`;
-      } else {
-        infoLocationEl.textContent = gpsText || (currentProject?.meta?.location || '—');
-      }
-    }
-    return;
-  }
-  // Parse EXIF for date/time and GPS; fall back to HTTP Last-Modified
-  fetch(url, { cache: 'force-cache' })
-    .then(async (r)=>{
-      const lastModified = r.headers.get('last-modified');
-      const buf = await r.arrayBuffer();
-      const meta = parseBasicExif(buf) || {};
-      const exifDate = meta.dateTimeOriginal || meta.dateTimeDigitized || meta.dateTime;
-      const taken = formatTaken(exifDate) || formatHttpDate(lastModified) || '';
-      const gps = meta?.gps;
-      const gpsText = gps ? `${gps.lat.toFixed(6)}, ${gps.lon.toFixed(6)}` : '';
-      exifCache.set(url, { taken, gpsText, gps });
-      if(infoTakenEl) infoTakenEl.textContent = taken || '—';
-      if(infoLocationEl){
-        if(gps && Number.isFinite(gps.lat) && Number.isFinite(gps.lon)){
-          infoLocationEl.innerHTML = `<a href="https://www.google.com/maps?q=${gps.lat},${gps.lon}" target="_blank" rel="noopener">${gpsText}</a>`;
-        } else {
-          infoLocationEl.textContent = gpsText || (currentProject?.meta?.location || '—');
-        }
-      }
-    })
-    .catch(()=>{
-      if(infoTakenEl) infoTakenEl.textContent = '—';
-      if(infoLocationEl) infoLocationEl.textContent = currentProject?.meta?.location || '—';
-    });
-}
-
-function parseBasicExif(arrayBuffer){
-  const data = new DataView(arrayBuffer);
-  let offset = 2;
-  if(data.getUint16(0) !== 0xFFD8) return {};
-  while(offset < data.byteLength){
-    const marker = data.getUint16(offset); offset += 2;
-    const size = data.getUint16(offset); offset += 2;
-    if(marker === 0xFFE1){ // APP1
-      // Check Exif header
-      if(getString(data, offset, 4) !== 'Exif') break;
-      const tiffOffset = offset + 6; // 'Exif\0\0'
-      return readTIFF(data, tiffOffset);
-    } else {
-      offset += size - 2;
-    }
-  }
-  return {};
-}
-
-function readTIFF(view, tiffOffset){
-  const endian = view.getUint16(tiffOffset);
-  const little = endian === 0x4949;
-  const getU16 = (o)=> little? view.getUint16(o,true):view.getUint16(o,false);
-  const getU32 = (o)=> little? view.getUint32(o,true):view.getUint32(o,false);
-  const getRational = (o)=>{
-    const num = getU32(o); const den = getU32(o+4);
-    return den? num/den : 0;
+function saveNow(){
+  clearTimeout(saveTimer);
+  if(!state.project) return;
+  const data = {
+    pos: Math.round(state.pos),
+    view: controls ? [controls.getAzimuthalAngle(), controls.getPolarAngle()] : undefined,
+    fov: camera ? camera.fov : DEFAULT_FOV,
+    adj: state.adj,
   };
-  const firstIFD = getU32(tiffOffset + 4) + tiffOffset;
-  const base = tiffOffset;
-  function readIFD(ifdOffset){
-    const count = getU16(ifdOffset);
-    const tags = new Map();
-    let p = ifdOffset + 2;
-    for(let i=0;i<count;i++){
-      const tag = getU16(p); const type = getU16(p+2); const num = getU32(p+4); const valueOff = p+8;
-      let valOff = getU32(valueOff) + base;
-      let value = null;
-      if(type === 2){ // ASCII
-        value = getAscii(view, (num>4? valOff : valueOff), num);
-      }else if(type === 3){ // SHORT
-        value = (num>1)? Array.from({length:num}, (_,$)=> getU16(valOff+2*$)) : getU16(valueOff);
-      }else if(type === 4){ // LONG
-        value = (num>1)? Array.from({length:num}, (_,$)=> getU32(valOff+4*$)) : getU32(valueOff);
-      }else if(type === 5){ // RATIONAL
-        if(num>1){ value = Array.from({length:num}, (_,$)=> getRational(valOff+8*$)); }
-        else value = getRational(valOff);
-      }
-      tags.set(tag, value);
-      p += 12;
-    }
-    const next = getU32(p);
-    return { tags, next: next? next+base:0 };
+  try { localStorage.setItem(storeKey(state.project.id), JSON.stringify(data)); } catch {}
+}
+function pref(key, fallback){
+  try { const v = localStorage.getItem(`p360:${key}`); return v == null ? fallback : JSON.parse(v); }
+  catch { return fallback; }
+}
+function setPref(key, value){ try { localStorage.setItem(`p360:${key}`, JSON.stringify(value)); } catch {} }
+
+// ---------------------------------------------------------------------------
+// UI binding (runs once)
+// ---------------------------------------------------------------------------
+function bindUI(){
+  if(bound) return;
+  const $ = (id)=> document.getElementById(id);
+  Object.assign(ui, {
+    modal: $('viewerModal'),
+    stageArea: $('stageArea'),
+    wrap: $('viewerCanvasWrap'),
+    title: $('viewerProjectTitle'),
+    stageLabel: $('viewerStageLabel'),
+    status: $('viewerStatus'),
+    loading: $('loadingOverlay'),
+    loadingText: $('loadingText'),
+    dragHint: $('dragHint'),
+    range: $('timelineRange'),
+    filmstrip: $('filmstrip'),
+    play: $('playBtn'),
+    prev: $('prevBtn'),
+    next: $('nextBtn'),
+    close: $('closeViewer'),
+    audio: $('audioBtn'),
+    recenter: $('recenterBtn'),
+    fullscreen: $('fullscreenBtn'),
+    sidebarBtn: $('sidebarBtn'),
+    sidebarClose: $('sidebarCloseBtn'),
+    sidebar: $('viewerSidebar'),
+    infoDesc: $('infoDesc'),
+    infoTags: $('infoTags'),
+    infoStage: $('infoStage'),
+    infoTaken: $('infoTaken'),
+    infoLocation: $('infoLocation'),
+    infoPlace: $('infoPlace'),
+    infoPhase: $('infoPhase'),
+    infoUpdated: $('infoUpdated'),
+    infoMedia: $('infoMedia'),
+    adjState: $('adjState'),
+    autoBtn: $('autoAdjustBtn'),
+    compareBtn: $('compareBtn'),
+    resetBtn: $('resetAdjustBtn'),
+    toastHost: $('toastHost'),
+  });
+  if(!ui.modal || !ui.wrap) throw new Error('Viewer markup not found');
+  bound = true;
+
+  ui.adj = {};
+  for(const key of Object.keys(ADJUSTMENTS)){
+    const input = $(`adj-${key}`);
+    const out = $(`adj-${key}-val`);
+    ui.adj[key] = { input, out };
+    input?.addEventListener('input', ()=> setAdjustment(key, parseFloat(input.value)));
+    input?.addEventListener('dblclick', ()=> setAdjustment(key, DEFAULT_ADJ[key]));
   }
-  const ifd0 = readIFD(firstIFD);
-  const exifPtr = ifd0.tags.get(0x8769);
-  const gpsPtr = ifd0.tags.get(0x8825);
-  let meta = {};
-  if(exifPtr){
-    const exifIFD = readIFD(exifPtr + base);
-    const dto = exifIFD.tags.get(0x9003); // DateTimeOriginal
-    const dtd = exifIFD.tags.get(0x9004); // DateTimeDigitized
-    const dt0 = ifd0.tags.get(0x0132);    // ModifyDate/DateTime
-    if(dto) meta.dateTimeOriginal = String(dto).trim();
-    if(dtd) meta.dateTimeDigitized = String(dtd).trim();
-    if(!meta.dateTimeOriginal && dt0) meta.dateTime = String(dt0).trim();
-  } else {
-    const dto0 = ifd0.tags.get(0x0132);
-    if(dto0) meta.dateTime = String(dto0).trim();
-  }
-  if(gpsPtr){
-    const gpsIFD = readIFD(gpsPtr + base);
-    const latRef = gpsIFD.tags.get(0x0001);
-    const lat = gpsIFD.tags.get(0x0002);
-    const lonRef = gpsIFD.tags.get(0x0003);
-    const lon = gpsIFD.tags.get(0x0004);
-    if(lat && lon){
-      const latVal = dmsToDeg(lat) * (latRef==='S'?-1:1);
-      const lonVal = dmsToDeg(lon) * (lonRef==='W'?-1:1);
-      meta.gps = { lat: latVal, lon: lonVal };
-    }
-  }
-  return meta;
+
+  ui.close?.addEventListener('click', requestClose);
+  ui.prev?.addEventListener('click', ()=> nudge(-1));
+  ui.next?.addEventListener('click', ()=> nudge(+1));
+  ui.play?.addEventListener('click', ()=> setPlaying(!state.playing));
+  ui.range?.addEventListener('input', ()=> { setPlaying(false); state.tween = null; setStagePos(parseFloat(ui.range.value)); });
+  ui.range?.addEventListener('change', ()=> animateTo(Math.round(parseFloat(ui.range.value))));
+  ui.audio?.addEventListener('click', ()=> setAudio(!state.audio));
+  ui.recenter?.addEventListener('click', recenter);
+  ui.fullscreen?.addEventListener('click', toggleFullscreen);
+  ui.sidebarBtn?.addEventListener('click', ()=> setSidebar(!state.sidebarOpen, true));
+  ui.sidebarClose?.addEventListener('click', ()=> setSidebar(false, true));
+  ui.autoBtn?.addEventListener('click', autoAdjust);
+  ui.resetBtn?.addEventListener('click', ()=> { setAdjustments({ ...DEFAULT_ADJ }); showToast('Adjustments reset to original', 'info'); });
+
+  // Hold to compare against the untouched original
+  const cmpOn = (e)=> { e.preventDefault?.(); setComparing(true); };
+  const cmpOff = ()=> setComparing(false);
+  ui.compareBtn?.addEventListener('pointerdown', cmpOn);
+  ['pointerup', 'pointerleave', 'pointercancel', 'blur'].forEach(ev=> ui.compareBtn?.addEventListener(ev, cmpOff));
+  ui.compareBtn?.addEventListener('keydown', (e)=> { if((e.key === ' ' || e.key === 'Enter') && !e.repeat) cmpOn(e); });
+  ui.compareBtn?.addEventListener('keyup', (e)=> { if(e.key === ' ' || e.key === 'Enter') cmpOff(); });
+
+  // Zoom (field of view): wheel + pinch
+  ui.wrap.addEventListener('wheel', (e)=> { e.preventDefault(); zoomBy(e.deltaY * 0.04); }, { passive: false });
+  let pinch = 0;
+  const dist = (t)=> Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  ui.wrap.addEventListener('touchstart', (e)=> { if(e.touches.length === 2) pinch = dist(e.touches); }, { passive: true });
+  ui.wrap.addEventListener('touchmove', (e)=> {
+    if(e.touches.length !== 2 || !pinch) return;
+    const d = dist(e.touches);
+    zoomBy((pinch - d) * 0.15);
+    pinch = d;
+  }, { passive: true });
+  ui.wrap.addEventListener('touchend', ()=> { pinch = 0; }, { passive: true });
+  ui.wrap.addEventListener('pointerdown', hideDragHint);
+
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+
+  // Block page pinch-zoom (iOS) while the viewer is open
+  const blockGesture = (e)=> { if(state.open) e.preventDefault(); };
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(ev=> document.addEventListener(ev, blockGesture, { passive: false }));
+
+  const onFsChange = ()=> {
+    const on = !!fullscreenElement();
+    ui.fullscreen?.setAttribute('aria-pressed', String(on));
+    ui.fullscreen?.setAttribute('title', on ? 'Exit full screen (F)' : 'Full screen (F)');
+    ui.modal.classList.toggle('is-fullscreen', on);
+    requestAnimationFrame(onResize);
+  };
+  document.addEventListener('fullscreenchange', onFsChange);
+  document.addEventListener('webkitfullscreenchange', onFsChange);
+  if(!canFullscreen() && ui.fullscreen) ui.fullscreen.hidden = true;
+
+  narrowMQ.addEventListener?.('change', ()=> setSidebar(narrowMQ.matches ? false : pref('sidebar', true)));
+  renderAdjustmentUI();
 }
 
-function dmsToDeg(arr){
-  if(Array.isArray(arr)) return (arr[0] + arr[1]/60 + arr[2]/3600);
-  return arr || 0;
-}
-
-function getAscii(view, offset, len){
-  let s='';
-  for(let i=0;i<len-1;i++) s += String.fromCharCode(view.getUint8(offset+i));
-  return s;
-}
-
-function getString(view, offset, len){
-  let s='';
-  for(let i=0;i<len;i++) s += String.fromCharCode(view.getUint8(offset+i));
-  return s;
-}
-
-function formatTaken(exifDate){
-  if(!exifDate) return '';
-  // EXIF format: YYYY:MM:DD HH:MM:SS
-  const m = /^([0-9]{4}):([0-9]{2}):([0-9]{2})[ T]([0-9]{2}):([0-9]{2}):([0-9]{2})/.exec(exifDate);
-  if(!m) return exifDate;
-  const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}`;
-  try{
-    const d = new Date(iso);
-    if(isNaN(d.getTime())) return exifDate;
-    return d.toLocaleString();
-  }catch{ return exifDate; }
-}
-
-function formatHttpDate(hdr){
-  if(!hdr) return '';
-  try{
-    const d = new Date(hdr);
-    if(isNaN(d.getTime())) return '';
-    return d.toLocaleString();
-  }catch{ return ''; }
-}
-
-function setExposure(v, persist = true){
-  if(!material) return;
-  material.uniforms.exposure.value = v;
-  if(exposureRange) exposureRange.value = String(v);
-  if(persist){
-    exposureByStage[currentStageIndex] = v;
-    saveSettings({ exposureByStage: { [currentStageIndex]: v } });
-  }
-}
-
-function setGamma(v, persist = true){
-  if(!material) return;
-  material.uniforms.gamma.value = v;
-  if(gammaRange) gammaRange.value = String(v);
-  if(persist){
-    gammaByStage[currentStageIndex] = v;
-    saveSettings({ gammaByStage: { [currentStageIndex]: v } });
-  }
-}
-
-// Apply saved (or default/auto) adjustments for a given stage
-function applyAdjustmentsForStage(index, allowAuto = true){
-  const eSaved = (exposureByStage && typeof exposureByStage[index] === 'number') ? exposureByStage[index] : null;
-  const gSaved = (gammaByStage && typeof gammaByStage[index] === 'number') ? gammaByStage[index] : null;
-  const e = eSaved ?? 1.0;
-  const g = gSaved ?? 1.3;
-  // Apply without persisting
-  setExposure(e, false);
-  setGamma(g, false);
-  if(allowAuto && (eSaved == null || gSaved == null)){
-    const i = index;
-    const url = (currentProject?.stages?.[i]?.url) || (currentProject?.stages?.[0]?.url);
-    if(url){
-      analyzeImage(url).then(({ exposure, gamma })=>{
-        if(eSaved == null){
-          if(currentStageIndex === i) setExposure(exposure);
-          else { exposureByStage[i] = exposure; saveSettings({ exposureByStage: { [i]: exposure } }); }
-        }
-        if(gSaved == null){
-          if(currentStageIndex === i) setGamma(gamma);
-          else { gammaByStage[i] = gamma; saveSettings({ gammaByStage: { [i]: gamma } }); }
-        }
-      }).catch(()=>{});
-    }
-  }
-}
-
+// ---------------------------------------------------------------------------
+// Renderer / scene (created once, reused across projects)
+// ---------------------------------------------------------------------------
 function initRenderer(){
   if(renderer) return;
-  renderer = new THREE.WebGLRenderer({ antialias: true, alpha:false });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  const w = container.clientWidth, h = container.clientHeight;
-  renderer.setSize(w, h);
-  renderer.xr.enabled = true;
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
-  container.appendChild(renderer.domElement);
+  renderer.toneMapping = THREE.NoToneMapping;
+  renderer.xr.enabled = true;
+  renderer.domElement.classList.add('viewer-canvas');
+  ui.wrap.prepend(renderer.domElement);
 
-  // Add VR button only when WebXR is available
-  const host = document.createElement('div');
-  host.className = 'vr-button-host';
-  const vrBtn = VRButton.createButton(renderer);
-  // Ensure the button sits fully inside the container (avoid clipping)
-  vrBtn.style.position = 'static';
-  vrBtn.style.right = '';
-  vrBtn.style.bottom = '';
-  host.appendChild(vrBtn);
-  container.appendChild(host);
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(DEFAULT_FOV, 1, 0.1, 2000);
+  camera.position.set(0, 0, 0.1);
 
-  // Resize when container dimensions change (e.g., modal opens, fullscreen)
-  if (typeof ResizeObserver !== 'undefined'){
-    const ro = new ResizeObserver(()=> onResize());
-    ro.observe(container);
-  }
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableZoom = false;
+  controls.enablePan = false;
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.12;
+  controls.rotateSpeed = 0.35;
+  controls.addEventListener('change', saveSoon);
 
-  // Hook XR session events
-  renderer.xr.addEventListener('sessionstart', ()=>{
-    showFsOverlay(true);
-    setupXRControllers();
-  });
-  renderer.xr.addEventListener('sessionend', ()=>{
-    showFsOverlay(document.fullscreenElement === container);
-  });
+  material = createPanoMaterial();
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(500, 96, 64), material));
+
+  if(typeof ResizeObserver !== 'undefined') new ResizeObserver(onResize).observe(ui.wrap);
+  window.addEventListener('resize', onResize);
+
+  // XR: trigger = next stage, other trigger = previous, squeeze = exit
+  try{
+    const c0 = renderer.xr.getController(0);
+    const c1 = renderer.xr.getController(1);
+    c0.addEventListener('select', ()=> nudge(+1));
+    c1.addEventListener('select', ()=> nudge(-1));
+    c0.addEventListener('squeeze', endXR);
+    c1.addEventListener('squeeze', endXR);
+    scene.add(c0, c1);
+  }catch{}
+
+  // Only show the VR button where immersive VR is actually available
+  navigator.xr?.isSessionSupported?.('immersive-vr').then((ok)=>{
+    if(!ok) return;
+    const host = document.createElement('div');
+    host.className = 'vr-button-host';
+    const btn = VRButton.createButton(renderer);
+    btn.removeAttribute('style');
+    btn.className = 'btn vr-btn';
+    host.appendChild(btn);
+    ui.wrap.appendChild(host);
+  }).catch(()=>{});
 }
 
-function getAngles(){
-  if(!controls) return { theta:0, phi:Math.PI/2 };
-  return { theta: controls.getAzimuthalAngle(), phi: controls.getPolarAngle() };
-}
-function normAngle(a){
-  if(!isFinite(a)) return 0;
-  while(a <= -Math.PI) a += Math.PI*2;
-  while(a > Math.PI) a -= Math.PI*2;
-  return a;
-}
-function setAngles(theta, phi){
-  if(!controls) return;
-  const curr = getAngles();
-  const dTheta = curr.theta - theta;
-  const dPhi = curr.phi - phi;
-  // Use API methods to avoid touching internals
-  if(typeof controls.rotateLeft === 'function') controls.rotateLeft(dTheta);
-  if(typeof controls.rotateUp === 'function') controls.rotateUp(dPhi);
-  controls.update();
-}
-
-function applySavedOrientationForStage(index){
-  if(stageOrients && stageOrients[index]){
-    const a = stageOrients[index];
-    setAngles(a[0], a[1]);
-    // Make this the reset baseline so Recenter works reliably
-    try{ controls?.saveState?.(); }catch{}
-    return;
-  }
-}
-
-// Ensure there is a baseline orientation saved for a stage
-function ensureStageOrient(index){
-  if(!controls) return;
-  if(!stageOrients) stageOrients = {};
-  if(typeof stageOrients[index] === 'undefined'){
-    const ang = getAngles();
-    stageOrients[index] = [ang.theta, ang.phi];
-    saveSettings({ orients: { [index]: stageOrients[index] } });
-    // Also set the current state as the reset baseline
-    try{ controls?.saveState?.(); }catch{}
-  }
-}
-
-function recenterToStageFront(){
-  // Prefer the controls reset baseline for smooth, reliable recentering
-  if(controls?.reset){ controls.reset(); return; }
-  // Fallback: use saved orientation or sensible default
-  const a = stageOrients?.[currentStageIndex];
-  if(a){ setAngles(a[0], a[1]); }
-  else { setAngles(0, Math.PI/2); ensureStageOrient(currentStageIndex); }
-}
-
-function onResize(){
-  if(!renderer) return;
-  const elem = document.fullscreenElement || container;
-  let w = elem?.clientWidth || window.innerWidth;
-  let h = elem?.clientHeight || window.innerHeight;
-  if(!w || !h){
-    const r = elem?.getBoundingClientRect?.();
-    w = r?.width || container.clientWidth;
-    h = r?.height || container.clientHeight;
-  }
-  const W = Math.max(1, Math.floor(w)), H = Math.max(1, Math.floor(h));
-  renderer.setSize(W, H);
-  if(camera){
-    camera.aspect = W / H;
-    camera.updateProjectionMatrix();
-  }
-}
-
-function animate(){
-  renderer.setAnimationLoop(()=>{
-    renderer.render(scene, camera);
-  });
-}
-
-function EquirectBlendMaterial(texA, texB){
+function createPanoMaterial(){
   return new THREE.ShaderMaterial({
-    uniforms:{
-      map1:{ value: texA },
-      map2:{ value: texB },
-      mixAmount:{ value: 0.0 },
-      exposure:{ value: 1.0 },
-      gamma:{ value: 1.0 }
+    uniforms: {
+      map1: { value: null },
+      map2: { value: null },
+      mixAmount: { value: 0 },
+      exposure: { value: 0 },     // EV stops
+      contrast: { value: 1 },     // multiplier around mid grey
+      midtones: { value: 1 },     // gamma exponent (<1 brightens)
+      saturation: { value: 1 },   // multiplier
     },
-    vertexShader:`
+    vertexShader: /* glsl */`
       varying vec2 vUv;
       void main(){
         vUv = uv;
         gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       }
     `,
-    fragmentShader:`
+    fragmentShader: /* glsl */`
       precision highp float;
       varying vec2 vUv;
       uniform sampler2D map1;
       uniform sampler2D map2;
       uniform float mixAmount;
       uniform float exposure;
-      uniform float gamma;
-      vec3 srgb_to_linear(vec3 c){
-        bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
-        vec3 low = c / 12.92;
-        vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
-        return mix(high, low, vec3(cutoff));
+      uniform float contrast;
+      uniform float midtones;
+      uniform float saturation;
+
+      vec3 toDisplay(vec3 c){
+        c = max(c, 0.0);
+        return mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, c * 12.92, vec3(lessThanEqual(c, vec3(0.0031308))));
       }
-      vec3 linear_to_srgb(vec3 c){
-        bvec3 cutoff = lessThanEqual(c, vec3(0.0031308));
-        vec3 low = 12.92 * c;
-        vec3 high = 1.055 * pow(c, vec3(1.0/2.4)) - 0.055;
-        return mix(high, low, vec3(cutoff));
+      vec3 toLinear(vec3 c){
+        c = max(c, 0.0);
+        return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, vec3(lessThanEqual(c, vec3(0.04045))));
       }
+
       void main(){
         vec2 uv = vec2(1.0 - vUv.x, vUv.y);
-        vec3 a = texture2D(map1, uv).rgb;
-        vec3 b = texture2D(map2, uv).rgb;
-        a = srgb_to_linear(a);
-        b = srgb_to_linear(b);
-        vec3 col = mix(a, b, clamp(mixAmount, 0.0, 1.0));
-        col *= exposure;
-        // Apply display gamma so higher gamma brightens (consistent with Exposure)
-        col = pow(max(col, 1e-6), vec3(1.0 / max(gamma, 1e-6)));
-        col = linear_to_srgb(col);
-        gl_FragColor = vec4(col, 1.0);
+        // Textures are tagged sRGB, so the GPU hands us linear values here. Do NOT decode again.
+        vec3 col = mix(texture2D(map1, uv).rgb, texture2D(map2, uv).rgb, clamp(mixAmount, 0.0, 1.0));
+        col *= exp2(exposure);
+
+        // Tone controls feel natural in display (perceptual) space
+        vec3 d = clamp(toDisplay(col), 0.0, 1.0);
+        d = pow(d, vec3(midtones));
+        d = (d - 0.5) * contrast + 0.5;
+        float l = dot(d, vec3(0.2126, 0.7152, 0.0722));
+        d = mix(vec3(l), d, saturation);
+
+        gl_FragColor = vec4(toLinear(clamp(d, 0.0, 1.0)), 1.0);
+        #include <colorspace_fragment>
       }
     `,
     side: THREE.BackSide,
-    toneMapped: false
+    depthWrite: false,
+    toneMapped: false,
   });
 }
 
-// Estimate exposure/gamma from the active image by sampling luminance
-async function autoAdjust(){
-  if(!currentProject) return;
-  const i = Math.floor(stagePos);
-  const url = (currentProject.stages?.[i]?.url) || (currentProject.stages?.[0]?.url);
-  try{
-    const { exposure, gamma } = await analyzeImage(url);
-    setExposure(exposure);
-    setGamma(gamma);
-    if(statusEl) statusEl.textContent = 'Auto adjustment applied';
-    showToast('Auto adjustment applied', 'success');
-  }catch(err){
-    console.warn('Auto adjust failed', err);
-    if(statusEl) statusEl.textContent = 'Auto adjustment failed';
-    showToast('Auto adjustment failed', 'error');
+function configureTexture(t){
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = THREE.RepeatWrapping;           // avoids a visible seam at the 0/360° join
+  t.wrapT = THREE.ClampToEdgeWrapping;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  t.needsUpdate = true;
+  return t;
+}
+
+function render(){
+  const now = performance.now();
+  if(state.tween){
+    const { from, to, start, dur, wrap } = state.tween;
+    const k = clamp((now - start) / dur, 0, 1);
+    // Long playback fades use a gentle sine curve; short manual steps use a snappier quad
+    const e = dur > TWEEN_MS * 2
+      ? 0.5 - Math.cos(Math.PI * k) / 2
+      : (k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2);
+    if(wrap && k < 1){
+      // Last stage → first stage: fade directly instead of rewinding through every stage
+      material.uniforms.map1.value = textureAt(from);
+      material.uniforms.map2.value = textureAt(to);
+      material.uniforms.mixAmount.value = e;
+    } else {
+      setStagePos(from + (to - from) * e, { persist: k >= 1 });
+    }
+    if(k >= 1){
+      state.tween = null;
+      if(state.playing) holdStage(now);
+    }
+  } else if(state.playing && now >= state.nextAt){
+    advancePlayback(now);
   }
+  controls.update();
+  renderer.render(scene, camera);
 }
 
-function srgbToLinearScalar(c){
-  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+function onResize(){
+  if(!renderer || !ui.wrap) return;
+  const w = Math.max(1, Math.floor(ui.wrap.clientWidth));
+  const h = Math.max(1, Math.floor(ui.wrap.clientHeight));
+  if(renderer.xr.isPresenting) return;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
 }
 
-async function analyzeImage(url){
-  const img = await loadImage(url);
-  const w = 256;
-  const h = Math.max(1, Math.round((img.height / img.width) * w));
-  const canvas = document.createElement('canvas');
-  canvas.width = w; canvas.height = h;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(img, 0, 0, w, h);
-  const data = ctx.getImageData(0,0,w,h).data;
-  let sum = 0;
-  for(let i=0;i<data.length;i+=4){
-    const r = data[i] / 255, g = data[i+1]/255, b = data[i+2]/255;
-    const rl = srgbToLinearScalar(r), gl = srgbToLinearScalar(g), bl = srgbToLinearScalar(b);
-    const Y = 0.2126*rl + 0.7152*gl + 0.0722*bl;
-    sum += Y;
-  }
-  const mean = sum / (w*h);
-  const target = 0.32; // even brighter middle gray target in linear space
-  const exposure = Math.min(2.0, Math.max(0.5, target / Math.max(1e-6, mean)));
-  const gamma = 1.2; // brighter default gamma
-  return { exposure, gamma };
-}
+// ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+function loadStage(i, url, token){
+  return new Promise((resolve)=>{
+    const done = (tex, video)=>{
+      if(token !== state.token){ tex?.dispose(); disposeVideo(video); resolve(); return; }
+      state.textures[i] = tex || null;
+      state.videos[i] = video || null;
+      state.failed[i] = !tex;
+      state.loaded++;
+      updateProgress();
+      refreshTextures();
+      syncMedia();
+      updateFilmstrip();
+      resolve();
+    };
 
-function loadImage(url){
-  return new Promise((resolve, reject)=>{
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = ()=> resolve(img);
-    img.onerror = reject;
-    // Allow caching so subsequent openings are instant
-    img.src = url;
+    if(isVideoUrl(url)){
+      const v = document.createElement('video');
+      v.crossOrigin = 'anonymous';
+      v.loop = true;
+      v.muted = true;
+      v.playsInline = true;
+      v.setAttribute('playsinline', '');
+      v.preload = 'auto';
+      v.src = url;
+      let settled = false;
+      const tex = configureTexture(new THREE.VideoTexture(v));
+      v.addEventListener('error', ()=>{
+        if(settled){ // failed after we had already accepted it
+          state.failed[i] = true; state.textures[i] = null; tex.dispose(); refreshTextures(); updateFilmstrip();
+          return;
+        }
+        settled = true; tex.dispose(); done(null, null);
+      }, { once: true });
+      const ok = ()=> { if(!settled){ settled = true; done(tex, v); } };
+      v.addEventListener('loadeddata', ok, { once: true });
+      setTimeout(ok, 2500);          // some mobile browsers won't fire loadeddata until play()
+      try { v.load(); } catch {}
+      return;
+    }
+
+    new THREE.TextureLoader().load(url, (t)=> done(configureTexture(t)), undefined, ()=> done(null));
   });
 }
 
-async function loadStages(urls){
-  // Retained for compatibility (full preloading), but buildScene uses progressive load
-  const loader = new THREE.TextureLoader();
-  const loadTex = (url)=> new Promise((res,rej)=> loader.load(url, (t)=> res(t), undefined, rej));
-  const texs = [];
-  stageVideos = [];
-  for(const url of urls){
-    try{
-      if(/\.(mp4|webm|ogg)(\?|$)/i.test(url)){
-        const video = document.createElement('video');
-        video.src = url;
-        video.crossOrigin = 'anonymous';
-        video.loop = true;
-        video.muted = true;
-        video.playsInline = true;
-        video.preload = 'auto';
-        const tex = new THREE.VideoTexture(video);
-        tex.colorSpace = THREE.SRGBColorSpace;
-        tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-        tex.needsUpdate = true;
-        texs.push(tex);
-        stageVideos.push(video);
-      } else {
-        const t = await loadTex(url);
-        t.colorSpace = THREE.SRGBColorSpace;
-        t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
-        texs.push(t);
-        stageVideos.push(null);
-      }
-    }catch(err){
-      console.warn('Failed to load stage', url, err);
-      texs.push(texs[texs.length-1] || null);
-      stageVideos.push(stageVideos[stageVideos.length-1] || null);
-    }
-  }
-  for(let i=0;i<texs.length;i++) if(!texs[i]) { texs[i] = texs[i-1] || texs.find(Boolean); stageVideos[i] = stageVideos[i-1] || null; }
-  return texs;
+function disposeVideo(v){
+  if(!v) return;
+  try { v.pause(); v.removeAttribute('src'); v.load(); } catch {}
 }
 
-function showLoadingOverlay(show, text){
-  try{
-    if(loadingOverlayEl){
-      // ensure overlay is top-most child over canvas
-      if(container && loadingOverlayEl.parentNode !== container){ container.appendChild(loadingOverlayEl); }
-      else if(container && container.lastElementChild !== loadingOverlayEl){ container.appendChild(loadingOverlayEl); }
-      loadingOverlayEl.style.display = show ? 'flex' : 'none';
-      const t = loadingOverlayEl.querySelector('.loading-text');
-      if(t && text) t.textContent = text;
-    }
-  }catch{}
+function teardownProject(){
+  state.tween = null;
+  state.textures.forEach((t)=> t?.dispose());
+  state.videos.forEach(disposeVideo);
+  state.textures = []; state.videos = []; state.failed = [];
+  state.loaded = 0;
+  if(material){ material.uniforms.map1.value = null; material.uniforms.map2.value = null; }
+  if(ui.filmstrip) ui.filmstrip.replaceChildren();
 }
 
 function updateProgress(){
-  if(!_progressTotal) return;
-  const msg = _progressLoaded >= _progressTotal ? 'Ready' : `Loading ${_progressLoaded}/${_progressTotal}…`;
-  if(statusEl) statusEl.textContent = msg;
-  if(loadingOverlayEl && loadingOverlayEl.style.display !== 'none'){
-    const t = loadingOverlayEl.querySelector('.loading-text');
-    if(t) t.textContent = msg;
+  const n = state.stages.length;
+  const loading = state.loaded < n;
+  if(ui.status){
+    ui.status.textContent = loading ? `Loading ${state.loaded}/${n}…` : '';
+    ui.status.hidden = !loading;
+  }
+  const anyReady = state.textures.some(Boolean);
+  if(anyReady) showLoading(false);
+  else if(!loading) showLoading(true, 'This project’s media could not be loaded.', true);
+  if(!loading){
+    const bad = state.failed.filter(Boolean).length;
+    if(bad && anyReady) showToast(`${bad} stage${bad > 1 ? 's' : ''} could not be loaded`, 'error', 4000);
   }
 }
 
-function loadOneStage(index, url){
-  return new Promise((resolve)=>{
-    const finish = ()=>{ _progressLoaded++; updateProgress(); resolve(); };
-    try{
-      if(/\.(mp4|webm|ogg)(\?|$)/i.test(url)){
-        const video = document.createElement('video');
-        video.src = url;
-        video.crossOrigin = 'anonymous';
-        video.loop = true;
-        video.muted = true;
-        video.playsInline = true;
-        video.preload = 'auto';
-        const tex = new THREE.VideoTexture(video);
-        tex.colorSpace = THREE.SRGBColorSpace;
-        tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-        tex.needsUpdate = true;
-        stageVideos[index] = video;
-        stageTextures[index] = tex;
-        finish();
-      } else {
-        const loader = new THREE.TextureLoader();
-        loader.load(url, (t)=>{
-          try{
-            t.colorSpace = THREE.SRGBColorSpace;
-            t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
-            stageTextures[index] = t;
-          }catch{}
-          finish();
-        }, undefined, ()=>{ finish(); });
+function showLoading(show, text, isError = false){
+  if(!ui.loading) return;
+  ui.loading.hidden = !show;
+  ui.loading.classList.toggle('is-error', !!isError);
+  if(text && ui.loadingText) ui.loadingText.textContent = text;
+}
+
+// Pick the texture for stage i, falling back to the nearest loaded stage while others stream in
+function textureAt(i){
+  const t = state.textures;
+  if(t[i]) return t[i];
+  for(let d = 1; d < t.length; d++){
+    if(t[i - d]) return t[i - d];
+    if(t[i + d]) return t[i + d];
+  }
+  return null;
+}
+
+function refreshTextures(){
+  if(!material) return;
+  const n = state.stages.length;
+  const a = textureAt(state.index);
+  material.uniforms.map1.value = a;
+  material.uniforms.map2.value = textureAt(Math.min(state.index + 1, n - 1)) || a;
+}
+
+// ---------------------------------------------------------------------------
+// Stages / timeline
+// ---------------------------------------------------------------------------
+function setStagePos(v, { persist = true } = {}){
+  const n = state.stages.length;
+  if(!n) return;
+  const pos = clamp(v, 0, n - 1);
+  const index = Math.min(n - 1, Math.floor(pos + 1e-6));
+  const changed = index !== state.index;
+  state.pos = pos;
+  state.index = index;
+  if(ui.range){
+    ui.range.value = String(pos);
+    ui.range.style.setProperty('--fill-to', `${n > 1 ? (pos / (n - 1)) * 100 : 0}%`);
+  }
+  refreshTextures();
+  if(material) material.uniforms.mixAmount.value = pos - index;
+  if(changed) syncMedia();
+  updateStageUI();
+  if(persist) saveSoon();
+}
+
+function animateTo(target, dur = TWEEN_MS){
+  const n = state.stages.length;
+  if(!n) return;
+  const to = clamp(Math.round(target), 0, n - 1);
+  if(Math.abs(to - state.pos) < 1e-3){ setStagePos(to); return; }
+  const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  if(reduce || !state.open){ setStagePos(to); return; }
+  state.tween = { from: state.pos, to, start: performance.now(), dur };
+}
+
+// ---------------------------------------------------------------------------
+// Playback: fade through the stages in order, hold on each, loop back to the start
+// ---------------------------------------------------------------------------
+function setPlaying(on){
+  const n = state.stages.length;
+  on = !!on && n > 1;
+  if(state.playing === on) return;
+  state.playing = on;
+  ui.play?.setAttribute('aria-pressed', String(on));
+  ui.play?.setAttribute('title', on ? 'Pause (Space)' : 'Play through stages (Space)');
+  ui.play?.setAttribute('aria-label', on ? 'Pause' : 'Play through stages');
+  ui.modal?.classList.toggle('is-playing', on);
+  if(on){
+    // Start moving almost straight away so pressing Play feels responsive
+    state.nextAt = performance.now() + 350;
+    if(!state.tween) showHold(350);
+  } else {
+    clearHold();
+  }
+}
+
+function advancePlayback(now){
+  const n = state.stages.length;
+  let next = (nearestIndex() + 1) % n;
+  // Skip stages that failed to load; wait for ones still loading
+  for(let tries = 0; tries < n && state.failed[next]; tries++) next = (next + 1) % n;
+  if(!state.textures[next]){ state.nextAt = now + 250; return; }
+  clearHold();
+  const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  if(next < nearestIndex() && !reduce){
+    state.tween = { from: nearestIndex(), to: next, start: now, dur: PLAY_FADE_MS, wrap: true };
+    const v = state.videos[next];
+    if(v){ v.muted = true; safePlay(v); }   // the stage fading in should already be moving
+    return;
+  }
+  animateTo(next, PLAY_FADE_MS);
+  if(!state.tween) holdStage(now);   // reduced motion: jumped instantly
+}
+
+function holdStage(now){
+  state.nextAt = now + PLAY_HOLD_MS;
+  showHold(PLAY_HOLD_MS);
+}
+
+// Progress bar on the active filmstrip item showing how long until the next stage
+function showHold(ms){
+  clearHold();
+  const el = ui.filmstrip?.children[nearestIndex()];
+  if(!el) return;
+  el.style.setProperty('--hold', `${ms}ms`);
+  void el.offsetWidth;   // restart the CSS animation
+  el.classList.add('is-holding');
+}
+function clearHold(){
+  ui.filmstrip?.querySelectorAll('.is-holding').forEach((el)=> el.classList.remove('is-holding'));
+}
+
+function nudge(dir){
+  setPlaying(false);
+  const base = state.tween ? state.tween.to : state.pos;
+  const target = dir > 0 ? Math.floor(base + 1e-6) + 1 : Math.ceil(base - 1e-6) - 1;
+  animateTo(target);
+}
+
+function nearestIndex(){ return clamp(Math.round(state.pos), 0, Math.max(0, state.stages.length - 1)); }
+
+let lastUiKey = '';
+function updateStageUI(){
+  const n = state.stages.length;
+  const i = nearestIndex();
+  const stage = state.stages[i];
+  if(ui.prev) ui.prev.disabled = state.pos <= 0.001;
+  if(ui.next) ui.next.disabled = state.pos >= n - 1.001;
+  // Everything below only needs to change when the nearest stage changes (not every tween frame)
+  const key = `${state.token}:${n}:${i}`;
+  if(key === lastUiKey) return;
+  lastUiKey = key;
+  if(ui.stageLabel) ui.stageLabel.textContent = n ? `${stage?.label || `Stage ${i + 1}`} · ${i + 1} of ${n}` : '';
+  if(ui.filmstrip){
+    const items = ui.filmstrip.children;
+    for(let k = 0; k < items.length; k++){
+      const active = k === i;
+      if(items[k].classList.contains('is-active') !== active){
+        items[k].classList.toggle('is-active', active);
+        items[k].setAttribute('aria-current', active ? 'step' : 'false');
+        if(active) items[k].scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
       }
-    }catch{
-      finish();
+    }
+  }
+  updateAudioUI();
+  updateInfo();
+}
+
+function buildFilmstrip(){
+  if(!ui.filmstrip) return;
+  const frag = document.createDocumentFragment();
+  state.stages.forEach((s, idx)=>{
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'film';
+    b.title = s.label || `Stage ${idx + 1}`;
+    b.addEventListener('click', ()=> { setPlaying(false); animateTo(idx); });
+    let media;
+    if(isVideoUrl(s.url)){
+      media = document.createElement('video');
+      media.muted = true; media.playsInline = true; media.preload = 'metadata';
+      media.src = `${s.url}#t=0.5`;
+    } else {
+      media = document.createElement('img');
+      media.src = s.url;   // same URL as the texture, so it comes from cache
+      media.alt = '';
+      media.loading = 'lazy';
+      media.decoding = 'async';
+    }
+    media.className = 'film-media';
+    const label = document.createElement('span');
+    label.className = 'film-label';
+    label.textContent = s.label || `Stage ${idx + 1}`;
+    b.append(media, label);
+    if(isVideoUrl(s.url)){
+      const tag = document.createElement('span');
+      tag.className = 'film-tag';
+      tag.textContent = 'Video';
+      b.appendChild(tag);
+    }
+    frag.appendChild(b);
+  });
+  ui.filmstrip.replaceChildren(frag);
+}
+
+function updateFilmstrip(){
+  if(!ui.filmstrip) return;
+  [...ui.filmstrip.children].forEach((el, i)=> {
+    el.classList.toggle('is-failed', !!state.failed[i]);
+    el.classList.toggle('is-pending', !state.textures[i] && !state.failed[i]);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Video + audio
+// ---------------------------------------------------------------------------
+function syncMedia(){
+  const vids = state.videos;
+  if(!vids.some(Boolean)) return;
+  const a = state.index;
+  const b = state.pos - a > 0.001 ? a + 1 : a;
+  vids.forEach((v, i)=>{
+    if(!v) return;
+    if(i === a || i === b){
+      v.muted = !(state.audio && i === nearestIndex());
+      if(state.open) safePlay(v); else v.pause();
+    } else {
+      v.muted = true;
+      v.pause();
     }
   });
 }
 
-function populateSideGallery(){
-  if(!sideGallery) return;
-  sideGallery.innerHTML = '';
-  stages.forEach((s, idx)=>{
-    const img = document.createElement('img');
-    img.src = s.url;
-    img.alt = s.label || `Stage ${idx+1}`;
-    img.className = 'thumb';
-    try{ img.loading = 'lazy'; img.decoding = 'async'; }catch{}
-    img.addEventListener('click', ()=> setStagePos(idx));
-    sideGallery.appendChild(img);
-  });
+function safePlay(v){
+  if(!v.paused) return;
+  try { const p = v.play(); p?.catch?.(()=>{}); } catch {}
 }
 
-async function buildScene({ title, stages: stageDefs }){
-  scene = new THREE.Scene();
-  const { clientWidth: w, clientHeight: h } = container;
-  camera = new THREE.PerspectiveCamera(75, w / Math.max(1,h), 0.1, 2000);
-  camera.position.set(0, 0, 0.1);
+function setAudio(on){
+  state.audio = !!on;
+  syncMedia();
+  updateAudioUI();
+  showToast(state.audio ? 'Sound on' : 'Sound off', 'info', 1400);
+}
 
-  controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableZoom = false;
-  controls.enablePan = false;
-  controls.rotateSpeed = 0.3;
-  controls.addEventListener('change', ()=> {
-    if(!stages.length) return;
-    const ang = getAngles();
-    stageOrients[currentStageIndex] = [ang.theta, ang.phi];
-    saveSettings({ orients: { [currentStageIndex]: stageOrients[currentStageIndex] } });
-  });
+function updateAudioUI(){
+  if(!ui.audio) return;
+  const anyVideo = state.stages.some((s)=> isVideoUrl(s.url));
+  ui.audio.hidden = !anyVideo;
+  const here = isVideoUrl(state.stages[nearestIndex()]?.url);
+  ui.audio.disabled = !here;
+  ui.audio.setAttribute('aria-pressed', String(state.audio));
+  ui.audio.classList.toggle('is-on', state.audio);
+  ui.audio.title = here ? (state.audio ? 'Mute (M)' : 'Unmute (M)') : 'No audio for this stage';
+  ui.audio.classList.toggle('attn', here && !state.audio);
+}
 
-  // Determine stages list from project
-  stages = Array.isArray(stageDefs) ? stageDefs.filter(s=> !!s?.url) : [];
-  if(!stages.length){
-    if(statusEl) statusEl.textContent = 'No images found';
+// ---------------------------------------------------------------------------
+// Camera
+// ---------------------------------------------------------------------------
+function setView(theta = 0, phi = Math.PI / 2){
+  if(!camera || !controls) return;
+  camera.position.setFromSphericalCoords(0.1, clamp(phi, 0.01, Math.PI - 0.01), theta);
+  controls.update();
+}
+function recenter(){
+  setView(0, Math.PI / 2);
+  setFov(DEFAULT_FOV);
+  saveSoon();
+}
+function setFov(f){
+  if(!camera) return;
+  camera.fov = clamp(f, MIN_FOV, MAX_FOV);
+  camera.updateProjectionMatrix();
+}
+function zoomBy(delta){ setFov(camera.fov + delta); saveSoon(); }
+
+// ---------------------------------------------------------------------------
+// Adjustments (shared by every stage of a project so before/after stay comparable)
+// ---------------------------------------------------------------------------
+function setAdjustment(key, value){
+  if(!(key in ADJUSTMENTS) || !Number.isFinite(value)) return;
+  const d = ADJUSTMENTS[key];
+  setAdjustments({ ...state.adj, [key]: clamp(value, d.min, d.max) });
+}
+
+function setAdjustments(next, { persist = true } = {}){
+  state.adj = { ...DEFAULT_ADJ, ...next };
+  applyAdjustments();
+  renderAdjustmentUI();
+  if(persist) saveSoon();
+}
+
+function isNeutral(a){ return Object.keys(DEFAULT_ADJ).every((k)=> Math.abs((a[k] ?? 0) - DEFAULT_ADJ[k]) < 1e-6); }
+
+function applyAdjustments(){
+  if(!material) return;
+  const a = state.comparing ? DEFAULT_ADJ : state.adj;
+  const u = material.uniforms;
+  u.exposure.value = a.exposure;
+  u.contrast.value = 1 + a.contrast / 100;
+  u.midtones.value = Math.pow(2, -a.midtones / 50);
+  u.saturation.value = 1 + a.saturation / 100;
+}
+
+function renderAdjustmentUI(){
+  if(!ui.adj) return;
+  for(const [key, d] of Object.entries(ADJUSTMENTS)){
+    const { input, out } = ui.adj[key] || {};
+    const v = state.adj[key] ?? 0;
+    if(input){
+      input.value = String(v);
+      const pct = ((v - d.min) / (d.max - d.min)) * 100;
+      const zero = ((0 - d.min) / (d.max - d.min)) * 100;
+      input.style.setProperty('--fill-from', `${Math.min(pct, zero)}%`);
+      input.style.setProperty('--fill-to', `${Math.max(pct, zero)}%`);
+    }
+    if(out){
+      out.textContent = d.fmt(v);
+      out.classList.toggle('is-changed', Math.abs(v) > 1e-6);
+    }
+  }
+  const neutral = isNeutral(state.adj);
+  if(ui.adjState){
+    ui.adjState.textContent = state.comparing ? 'Showing original' : (neutral ? 'Original' : 'Adjusted');
+    ui.adjState.classList.toggle('is-adjusted', !neutral && !state.comparing);
+  }
+  if(ui.resetBtn) ui.resetBtn.disabled = neutral;
+  if(ui.compareBtn) ui.compareBtn.disabled = neutral;
+}
+
+function setComparing(on){
+  if(state.comparing === !!on) return;
+  state.comparing = !!on;
+  ui.compareBtn?.classList.toggle('is-active', state.comparing);
+  applyAdjustments();
+  renderAdjustmentUI();
+}
+
+// Suggest a gentle exposure/contrast correction from all loaded stages (averaged, so every
+// stage gets the same treatment). Only runs when the user asks for it.
+async function autoAdjust(){
+  const sources = state.textures.map((t)=> t?.image).filter(Boolean);
+  if(!sources.length){ showToast('Wait for the images to finish loading', 'info'); return; }
+  try{
+    const W = 256, H = 128;
+    const canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    let logSum = 0, count = 0;
+    const lumas = [];
+    for(const src of sources){
+      if(src instanceof HTMLVideoElement && src.readyState < 2) continue;
+      ctx.drawImage(src, 0, 0, W, H);
+      // Ignore the poles (ceiling/floor) which are heavily stretched in equirect images
+      const y0 = Math.floor(H * 0.2), y1 = Math.ceil(H * 0.8);
+      const data = ctx.getImageData(0, y0, W, y1 - y0).data;
+      for(let p = 0; p < data.length; p += 16){   // every 4th pixel is plenty
+        const r = srgbToLinear(data[p] / 255), g = srgbToLinear(data[p + 1] / 255), b = srgbToLinear(data[p + 2] / 255);
+        const Y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        logSum += Math.log(1e-4 + Y);
+        lumas.push(Y);
+        count++;
+      }
+    }
+    if(!count) throw new Error('no pixels');
+    const key = Math.exp(logSum / count);                       // log-average luminance
+    const exposure = roundTo(clamp(Math.log2(0.18 / key) * 0.7, -1.5, 1.5), 0.05);
+    // Mild contrast boost for flat images (based on the 5–95% display-space spread)
+    lumas.sort((a, b)=> a - b);
+    const lo = linearToSrgb(lumas[Math.floor(lumas.length * 0.05)] * Math.pow(2, exposure));
+    const hi = linearToSrgb(lumas[Math.floor(lumas.length * 0.95)] * Math.pow(2, exposure));
+    const spread = clamp(hi, 0, 1) - clamp(lo, 0, 1);
+    const contrast = Math.round(clamp((0.75 / Math.max(spread, 0.05) - 1) * 25, 0, 20));
+    setAdjustments({ ...state.adj, exposure, contrast, midtones: 0 });
+    showToast(`Auto: ${ADJUSTMENTS.exposure.fmt(exposure)}, contrast ${signed(contrast)}`, 'success');
+  }catch(err){
+    console.warn('Auto adjust failed', err);
+    showToast('Auto adjust is not available for this media', 'error');
+  }
+}
+const roundTo = (v, s)=> Math.round(v / s) * s;
+const srgbToLinear = (c)=> c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+const linearToSrgb = (c)=> c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+
+// ---------------------------------------------------------------------------
+// Sidebar, fullscreen, XR, keyboard, hint, toasts
+// ---------------------------------------------------------------------------
+function setSidebar(open, remember = false){
+  state.sidebarOpen = !!open;
+  ui.modal?.classList.toggle('sidebar-open', state.sidebarOpen);
+  ui.sidebarBtn?.setAttribute('aria-expanded', String(state.sidebarOpen));
+  if(remember && !narrowMQ.matches) setPref('sidebar', state.sidebarOpen);
+  requestAnimationFrame(onResize);
+}
+
+function fullscreenElement(){ return document.fullscreenElement || document.webkitFullscreenElement || null; }
+function canFullscreen(){
+  const el = document.documentElement;
+  return !!(el.requestFullscreen || el.webkitRequestFullscreen);
+}
+function toggleFullscreen(){
+  const target = ui.stageArea || ui.wrap;
+  if(fullscreenElement()){
+    (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
     return;
   }
-  // Progressive load: first show stage 0 ASAP, then fill the rest
-  stageTextures = new Array(stages.length).fill(null);
-  stageVideos = new Array(stages.length).fill(null);
-  _progressLoaded = 0;
-  _progressTotal = stages.length;
-
-  const urls = stages.map(s=> s.url);
-  // Load first stage first for immediate display
-  await loadOneStage(0, urls[0]);
-  if(timelineRange){
-    timelineRange.min = '0';
-    timelineRange.max = String(Math.max(0, stages.length-1));
-    timelineRange.step = stages.length > 1 ? '0.001' : '1';
-  }
-  updateTimelineLegend(stages.map(s=> s.label || 'Stage'));
-  updateTimelineTicks(stages.length);
-  populateSideGallery();
-
-  const texA = getTextureAt(0);
-  const texB = getTextureAt(Math.min(1, stageTextures.length-1)) || texA;
-  material = EquirectBlendMaterial(texA, texB);
-  mixUniform = material.uniforms.mixAmount;
-
-  const geom = new THREE.SphereGeometry(500, 64, 48);
-  sphere = new THREE.Mesh(geom, material);
-  scene.add(sphere);
-
-  // Hide overlay once first frame is ready, continue background loading
-  showLoadingOverlay(false);
-  updateProgress();
-  if(_progressLoaded >= _progressTotal){ if(statusEl) statusEl.textContent = 'Ready'; }
-  if(titleEl) titleEl.textContent = title || 'Project';
-  // Initialize defaults without persisting over saved settings
-  setStagePos(0.0, false);
-  updateInfoPanel();
-  // Restore saved per-stage orientations & adjustments
-  const saved = loadSettings();
-  stageOrients = saved.orients || {};
-  exposureByStage = saved.exposureByStage || {};
-  gammaByStage = saved.gammaByStage || {};
-  applySavedOrientationForStage(0);
-  ensureStageOrient(0);
-  applyAdjustmentsForStage(0, true);
-  // start initial video(s)
-  playStageMedia(0);
-  animate();
-
-  // Kick off background loading for remaining stages (including stage 1)
-  const tasks = [];
-  for(let i=1;i<urls.length;i++) tasks.push(loadOneStage(i, urls[i]));
-  Promise.all(tasks).then(()=>{ updateProgress(); if(statusEl) statusEl.textContent = 'Ready'; playStageMedia(currentStageIndex); });
+  const req = target.requestFullscreen || target.webkitRequestFullscreen;
+  try { const p = req?.call(target, { navigationUI: 'hide' }); p?.catch?.(()=>{}); } catch {}
 }
 
+function endXR(){ renderer?.xr?.getSession?.()?.end?.(); }
+
+function onKeyDown(e){
+  if(!state.open) return;
+  if(e.key === 'Escape'){
+    if(renderer?.xr?.isPresenting) endXR();
+    else if(fullscreenElement()) toggleFullscreen();
+    else if(narrowMQ.matches && state.sidebarOpen) setSidebar(false);
+    else requestClose();
+    e.preventDefault();
+    return;
+  }
+  const t = e.target;
+  if(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  if(e.ctrlKey || e.metaKey || e.altKey) return;
+  switch(e.key){
+    case ' ':
+      if(t?.tagName === 'BUTTON') return;   // let Space activate the focused button
+      if(!e.repeat) setPlaying(!state.playing);
+      break;
+    case 'p': case 'P': if(!e.repeat) setPlaying(!state.playing); break;
+    case 'ArrowRight': nudge(+1); break;
+    case 'ArrowLeft': nudge(-1); break;
+    case 'Home': setPlaying(false); animateTo(0); break;
+    case 'End': setPlaying(false); animateTo(state.stages.length - 1); break;
+    case 'f': case 'F': toggleFullscreen(); break;
+    case 'r': case 'R': recenter(); break;
+    case 'i': case 'I': setSidebar(!state.sidebarOpen, true); break;
+    case 'm': case 'M': if(!ui.audio?.disabled && !ui.audio?.hidden) setAudio(!state.audio); break;
+    case 'c': case 'C': if(!e.repeat && !isNeutral(state.adj)) setComparing(true); break;
+    case '+': case '=': zoomBy(-5); break;
+    case '-': case '_': zoomBy(5); break;
+    default: return;
+  }
+  e.preventDefault();
+}
+function onKeyUp(e){ if(e.key === 'c' || e.key === 'C') setComparing(false); }
+
+function showDragHint(){
+  if(!ui.dragHint || pref('hintSeen', false)) return;
+  ui.dragHint.hidden = false;
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(hideDragHint, 4000);
+}
+function hideDragHint(){
+  if(!ui.dragHint || ui.dragHint.hidden) return;
+  ui.dragHint.hidden = true;
+  setPref('hintSeen', true);
+}
+
+export function showToast(message, type = 'info', timeoutMs = 2600){
+  const host = ui.toastHost || document.getElementById('toastHost');
+  if(!host) return;
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.setAttribute('role', type === 'error' ? 'alert' : 'status');
+  el.textContent = message;
+  host.appendChild(el);
+  setTimeout(()=>{ el.classList.add('leaving'); setTimeout(()=> el.remove(), 220); }, timeoutMs);
+}
+
+// ---------------------------------------------------------------------------
+// Info panel
+// ---------------------------------------------------------------------------
+function setText(el, text){ if(el) el.textContent = text || '—'; }
+
+function renderStaticInfo(){
+  const p = state.project || {};
+  const meta = p.meta || {};
+  const campus = p.campus || {};
+  if(ui.infoDesc) ui.infoDesc.textContent = meta.description || p.description || 'No description yet.';
+  if(ui.infoTags){
+    ui.infoTags.replaceChildren(...(p.tags || []).map((t)=>{
+      const s = document.createElement('span'); s.className = 'tag'; s.textContent = t; return s;
+    }));
+    ui.infoTags.hidden = !(p.tags || []).length;
+  }
+  setText(ui.infoPlace, [campus.campus, campus.building, campus.room].filter(Boolean).join(' · '));
+  setText(ui.infoPhase, meta.phase);
+  setText(ui.infoUpdated, formatIsoDate(meta.updated));
+  const imgs = state.stages.filter((s)=> !isVideoUrl(s.url)).length;
+  const vids = state.stages.length - imgs;
+  setText(ui.infoMedia, [imgs && `${imgs} image${imgs > 1 ? 's' : ''}`, vids && `${vids} video${vids > 1 ? 's' : ''}`].filter(Boolean).join(' · '));
+}
+
+const exifCache = new Map();   // url -> Promise<{ taken, gps }>
+let infoSeq = 0;
+
+function updateInfo(){
+  const i = nearestIndex();
+  const stage = state.stages[i];
+  setText(ui.infoStage, stage ? `${stage.label || `Stage ${i + 1}`} (${i + 1} of ${state.stages.length})` : '');
+  const fallbackLoc = state.project?.meta?.location;
+  const nameDate = stage?.date ? formatIsoDate(stage.date) : '';   // from a dated file name
+  if(!stage?.url || !JPEG_RE.test(stage.url)){
+    setText(ui.infoTaken, nameDate);
+    setText(ui.infoLocation, fallbackLoc);
+    return;
+  }
+  const seq = ++infoSeq;
+  readExif(stage.url).then(({ exifTaken, httpTaken, gps } = {})=>{
+    if(seq !== infoSeq) return;
+    setText(ui.infoTaken, exifTaken || nameDate || httpTaken);
+    if(gps && Number.isFinite(gps.lat) && Number.isFinite(gps.lon) && ui.infoLocation){
+      const a = document.createElement('a');
+      a.href = `https://www.google.com/maps?q=${gps.lat},${gps.lon}`;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = fallbackLoc ? `${fallbackLoc} (map)` : `${gps.lat.toFixed(5)}, ${gps.lon.toFixed(5)}`;
+      ui.infoLocation.replaceChildren(a);
+    } else {
+      setText(ui.infoLocation, fallbackLoc);
+    }
+  });
+}
+
+function readExif(url){
+  if(!exifCache.has(url)){
+    exifCache.set(url, (async ()=>{
+      try{
+        // EXIF lives in the first few KB; ask for just that (servers without Range support send it all)
+        const r = await fetch(url, { headers: { Range: 'bytes=0-131071' } });
+        if(!r.ok) return {};
+        const lastModified = r.headers.get('last-modified');
+        const buf = await r.arrayBuffer();
+        let meta = {};
+        try { meta = parseBasicExif(buf) || {}; } catch {}
+        const raw = meta.dateTimeOriginal || meta.dateTimeDigitized || meta.dateTime;
+        return { exifTaken: formatExifDate(raw), httpTaken: formatHttpDate(lastModified), gps: meta.gps };
+      }catch{ return {}; }
+    })());
+  }
+  return exifCache.get(url);
+}
+
+function parseBasicExif(arrayBuffer){
+  const data = new DataView(arrayBuffer);
+  if(data.byteLength < 4 || data.getUint16(0) !== 0xFFD8) return {};
+  let offset = 2;
+  while(offset + 4 <= data.byteLength){
+    const marker = data.getUint16(offset);
+    const size = data.getUint16(offset + 2);
+    if((marker & 0xFF00) !== 0xFF00 || size < 2 || marker === 0xFFDA) break;   // not a marker / start of scan
+    if(marker === 0xFFE1 && getString(data, offset + 4, 4) === 'Exif'){
+      return readTIFF(data, offset + 10);
+    }
+    offset += 2 + size;
+  }
+  return {};
+}
+
+function readTIFF(view, base){
+  const little = view.getUint16(base) === 0x4949;
+  const u16 = (o)=> view.getUint16(o, little);
+  const u32 = (o)=> view.getUint32(o, little);
+  const rational = (o)=> { const d = u32(o + 4); return d ? u32(o) / d : 0; };
+  function readIFD(at){
+    const count = u16(at);
+    const tags = new Map();
+    let p = at + 2;
+    for(let i = 0; i < count; i++, p += 12){
+      const tag = u16(p), type = u16(p + 2), num = u32(p + 4);
+      const inline = p + 8;
+      const off = () => u32(inline) + base;
+      let value = null;
+      if(type === 2) value = getString(view, num > 4 ? off() : inline, Math.max(0, num - 1));
+      else if(type === 3) value = num > 1 ? Array.from({ length: num }, (_, k)=> u16(off() + 2 * k)) : u16(inline);
+      else if(type === 4) value = num > 1 ? Array.from({ length: num }, (_, k)=> u32(off() + 4 * k)) : u32(inline);
+      else if(type === 5) value = num > 1 ? Array.from({ length: num }, (_, k)=> rational(off() + 8 * k)) : rational(off());
+      tags.set(tag, value);
+    }
+    return tags;
+  }
+  const ifd0 = readIFD(u32(base + 4) + base);
+  const meta = {};
+  const exifPtr = ifd0.get(0x8769);
+  if(exifPtr){
+    const exif = readIFD(exifPtr + base);
+    if(exif.get(0x9003)) meta.dateTimeOriginal = String(exif.get(0x9003)).trim();
+    if(exif.get(0x9004)) meta.dateTimeDigitized = String(exif.get(0x9004)).trim();
+  }
+  if(ifd0.get(0x0132)) meta.dateTime = String(ifd0.get(0x0132)).trim();
+  const gpsPtr = ifd0.get(0x8825);
+  if(gpsPtr){
+    const gps = readIFD(gpsPtr + base);
+    const lat = gps.get(0x0002), lon = gps.get(0x0004);
+    if(lat && lon){
+      const deg = (a)=> Array.isArray(a) ? a[0] + a[1] / 60 + a[2] / 3600 : a || 0;
+      meta.gps = { lat: deg(lat) * (gps.get(0x0001) === 'S' ? -1 : 1), lon: deg(lon) * (gps.get(0x0003) === 'W' ? -1 : 1) };
+    }
+  }
+  return meta;
+}
+
+function getString(view, offset, len){
+  let s = '';
+  for(let i = 0; i < len && offset + i < view.byteLength; i++){
+    const c = view.getUint8(offset + i);
+    if(c === 0) break;
+    s += String.fromCharCode(c);
+  }
+  return s;
+}
+
+const dateFmt = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+const dayFmt = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' });
+function formatExifDate(s){
+  const m = /^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(s || '');
+  if(!m) return s || '';
+  const d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  return isNaN(d) ? s : dateFmt.format(d);
+}
+function formatHttpDate(h){
+  const d = h ? new Date(h) : null;
+  return d && !isNaN(d) ? dateFmt.format(d) : '';
+}
+export function formatIsoDate(s){
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || '');
+  if(!m) return s || '';
+  return dayFmt.format(new Date(+m[1], +m[2] - 1, +m[3]));    // local date, no UTC shift
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+/**
+ * Open the viewer for a project.
+ * @param {object} project  { id, title, meta, campus, tags, stages: Stage[] | Promise<Stage[]> }
+ *                          Stage = { label, url }
+ */
 export async function openViewer(project){
-  ensureUIRefs();
-  currentProject = project;
-  // project.stages should be provided by the caller (main.js discovery)
-
-  // Show modal
-  modalEl.setAttribute('aria-hidden', 'false');
-  // Reset collapsed state on open (landscape/desktop)
-  const g = viewerGridEl || modalEl.querySelector('.viewer-grid');
-  g?.classList.remove('collapse-left','collapse-right');
-  // Ensure chevrons show immediately
-  syncCollapseUI();
-  // Update toggle state after DOM settles
-  setTimeout(()=>{ syncCollapseUI(); },0);
-  document.body.classList.add('viewer-open');
-  if(statusEl) statusEl.textContent = 'Loading…';
-  if(titleEl) titleEl.textContent = project.title || 'Project';
-
-  // Ensure renderer exists now that container is visible
+  bindUI();
   initRenderer();
-  // Show overlay immediately while first texture prepares
-  showLoadingOverlay(true, 'Loading…');
-  // Block browser zoom gestures while viewer is open (mobile/tablet)
-  try{
-    const prevent = (e)=> { e.preventDefault(); };
-    const onTouchEnd = (()=>{ let lt=0; return (e)=>{ const now=Date.now(); if(now-lt<300){ e.preventDefault(); } lt=now; }; })();
-    document.addEventListener('gesturestart', prevent, { passive:false });
-    document.addEventListener('gesturechange', prevent, { passive:false });
-    document.addEventListener('gestureend', prevent, { passive:false });
-    modalEl.addEventListener('touchend', onTouchEnd, { passive:false });
-    _blockZoomHandlers = [
-      ['gesturestart', prevent],['gesturechange', prevent],['gestureend', prevent],['touchend', onTouchEnd]
-    ];
-  }catch{}
-  // Keyboard shortcuts for navigation in fullscreen/VR
-  const onKey = (e)=>{
-    if(e.key === 'ArrowRight') nudgeStage(+1);
-    else if(e.key === 'ArrowLeft') nudgeStage(-1);
-    else if(e.key === 'Escape') exitXRorFS();
-  };
-  window.addEventListener('keydown', onKey);
-  closeViewer._onKey = onKey;
 
-  // (Re)size renderer to container
+  const wasOpen = state.open;
+  state.open = true;
+  if(!wasOpen) lastFocus = document.activeElement;
+  ui.modal.setAttribute('aria-hidden', 'false');
+  ui.modal.removeAttribute('inert');
+  document.body.classList.add('viewer-open');
+  setSidebar(narrowMQ.matches ? false : pref('sidebar', true));
+  if(ui.title) ui.title.textContent = project.title || 'Project';
+  renderer.setAnimationLoop(render);
   onResize();
-  window.addEventListener('resize', onResize);
+  if(!wasOpen) ui.close?.focus({ preventScroll: true });
 
-  // Dispose previous scene if any
-  if(renderer) renderer.setAnimationLoop(null);
-  if(scene){
-    scene.traverse(obj=> {
-      if(obj.isMesh){ obj.geometry?.dispose(); obj.material?.dispose?.(); }
-    });
-    scene = null;
+  // Re-opening the same project: everything is still in memory
+  if(state.project?.id === project.id && state.textures.some(Boolean)){
+    syncMedia();
+    updateStageUI();
+    return;
   }
 
-  try{
-    await buildScene(project);
-    // After camera is ready, force a resize to update aspect
-    onResize();
-    // Apply saved adjustments and position if present (per stage)
-    const saved = loadSettings();
-    // Load saved maps
-    stageOrients = saved.orients || {};
-    exposureByStage = saved.exposureByStage || {};
-    gammaByStage = saved.gammaByStage || {};
-    applySavedOrientationForStage(currentStageIndex);
-    applyAdjustmentsForStage(currentStageIndex, true);
-  }catch(err){
-    console.error(err);
-    if(statusEl) statusEl.textContent = 'Failed to load images';
+  setPlaying(false);
+  saveNow();
+  teardownProject();
+  const token = ++state.token;
+  state.project = project;
+  state.stages = [];
+  state.pos = 0; state.index = 0;
+  updateStageUI();
+  showLoading(true, 'Loading…');
+  if(ui.status){ ui.status.hidden = false; ui.status.textContent = 'Loading…'; }
+
+  let stages;
+  try { stages = await project.stages; } catch { stages = []; }
+  if(token !== state.token) return;
+  state.stages = (Array.isArray(stages) ? stages : []).filter((s)=> s && s.url);
+  const n = state.stages.length;
+
+  const saved = loadSettings(project.id);
+  state.adj = { ...DEFAULT_ADJ, ...(saved.adj || {}) };
+  applyAdjustments();
+  renderAdjustmentUI();
+  renderStaticInfo();
+  buildFilmstrip();
+
+  if(ui.range){
+    ui.range.min = '0';
+    ui.range.max = String(Math.max(0, n - 1));
+    ui.range.step = 'any';
+    ui.range.disabled = n < 2;
   }
+  ui.modal.classList.toggle('single-stage', n < 2);
+
+  if(!n){
+    showLoading(true, 'No media found for this project.', true);
+    if(ui.status) ui.status.hidden = true;
+    updateStageUI();
+    return;
+  }
+
+  state.textures = new Array(n).fill(null);
+  state.videos = new Array(n).fill(null);
+  state.failed = new Array(n).fill(false);
+  state.loaded = 0;
+
+  const start = clamp(Math.round(saved.pos ?? 0), 0, n - 1);
+  state.pos = start; state.index = start;
+  if(Array.isArray(saved.view)) setView(saved.view[0], saved.view[1]); else setView();
+  setFov(saved.fov ?? DEFAULT_FOV);
+  updateStageUI();
+
+  // Show the starting stage as soon as possible, then stream the rest in
+  await loadStage(start, state.stages[start].url, token);
+  if(token !== state.token) return;
+  setStagePos(start, { persist: false });
+  showDragHint();
+  updateFilmstrip();
+  state.stages.forEach((s, i)=> { if(i !== start) loadStage(i, s.url, token); });
 }
 
 export function closeViewer(){
-  if(!modalEl) return;
-  modalEl.setAttribute('aria-hidden', 'true');
+  if(!state.open) return;
+  state.open = false;
+  setPlaying(false);
+  state.tween = null;
+  setComparing(false);
+  saveNow();
+  if(fullscreenElement()) toggleFullscreen();
+  endXR();
+  renderer?.setAnimationLoop(null);
+  state.videos.forEach((v)=> { try { v?.pause(); } catch {} });
+  ui.modal.setAttribute('aria-hidden', 'true');
+  ui.modal.setAttribute('inert', '');
   document.body.classList.remove('viewer-open');
-  window.removeEventListener('resize', onResize);
-  if(closeViewer._onKey){ window.removeEventListener('keydown', closeViewer._onKey); closeViewer._onKey = null; }
-  if(renderer){ renderer.setAnimationLoop(null); }
-  // pause any videos
-  if(stageVideos && stageVideos.length){ for(const v of stageVideos){ try{ v && v.pause(); }catch{} } }
-  // leave canvas & VR button mounted for faster reopen
-  // Remove zoom blockers
-  try{
-    for(const [ev, fn] of _blockZoomHandlers){
-      if(ev.startsWith('gesture')) document.removeEventListener(ev, fn, { passive:false });
-      else if(ev==='touchend') modalEl?.removeEventListener(ev, fn, { passive:false });
-    }
-    _blockZoomHandlers = [];
-  }catch{}
+  hideDragHint();
+  if(lastFocus && document.contains(lastFocus)) lastFocus.focus({ preventScroll: true });
+  lastFocus = null;
 }
+
+export function isViewerOpen(){ return state.open; }

@@ -24,20 +24,24 @@ function Save-Jpeg($bitmap, [string]$outPath, [int]$quality){
   $ep.Dispose()
 }
 
+# Same ordering as stages.js: numbered (000-*) first, then dated (20260216_*, 2026-02-16_*), then anything else
 function Get-BaseImage([string]$dir){
-  $files = Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-  $primary = $files | Where-Object { $_ -match "\\000-.*\.jpg$" } | Select-Object -First 1
-  if($primary){ return $primary }
-  $any = $files | Where-Object { $_ -match "\.jpg$" } | Select-Object -First 1
-  return $any
+  $files = Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '\.jpe?g$' -and $_.Name -notmatch '-thumb\.jpe?g$' } |
+    Sort-Object Name | Select-Object -ExpandProperty Name
+  $numbered = $files | Where-Object { $_ -match '^\d{3}-' -and $_ -notmatch '^999-' } | Select-Object -First 1
+  if($numbered){ return (Join-Path $dir $numbered) }
+  $dated = $files | Where-Object { $_ -match '^(?:[a-z]{2,6}[_-])?(19|20)\d{2}-?\d{2}-?\d{2}(?!\d)' } |
+    Sort-Object { ($_ -replace '^(?:[a-z]{2,6}[_-])?((19|20)\d{2})-?(\d{2})-?(\d{2}).*$', '$1$3$4') } | Select-Object -First 1
+  if($dated){ return (Join-Path $dir $dated) }
+  $any = $files | Select-Object -First 1
+  if($any){ return (Join-Path $dir $any) }
+  return $null
 }
 
+# 000-kitchen.jpg -> 000-kitchen-thumb.jpg, 20260216_C210.jpg -> 20260216_C210-thumb.jpg
 function Get-ThumbPath([string]$basePath){
-  $name = [System.IO.Path]::GetFileName($basePath)
-  $dir = [System.IO.Path]::GetDirectoryName($basePath)
-  $m = [regex]::Match($name, '^000-([^.]+)\.jpg$', 'IgnoreCase')
-  if($m.Success){ $slug = $m.Groups[1].Value } else { $slug = ($name -replace '\\.jpg$', '').TrimStart('0','-') }
-  return (Join-Path $dir ("000-$slug-thumb.jpg"))
+  return ($basePath -replace '\.jpe?g$', '-thumb.jpg')
 }
 
 Add-Type -AssemblyName System.Drawing
