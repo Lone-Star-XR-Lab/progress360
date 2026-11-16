@@ -3,20 +3,24 @@
 Progress360 is a static, build-free site. Everything runs in the browser:
 
 ```
-index.html ── loads ──> main.js (ES module) ── imports ──> viewer.js ── imports ──> three (CDN, via import map)
-     │
+index.html ── loads ──> main.js (ES module) ─┬─ imports ──> viewer.js ── imports ──> three (vendor/, via import map)
+     │                                      ├─ imports ──> stages.js, exif.js
+     │                                      └─ loads on demand ──> vendor/leaflet (map view)
      └── registers ──> sw.js (service worker)
 ```
 
 | File | Responsibility |
 |---|---|
-| `index.html` | All markup: site header, gallery shell, the viewer dialog (hidden until opened), an inline SVG icon sprite, and the import map that points `three` and `three/addons/` at jsDelivr (three.js **0.169.0**). |
+| `index.html` | All markup: site header, gallery shell and map, the viewer dialog (hidden until opened) with the split-view, hotspot and editor UI, an inline SVG icon sprite, and the import map that points `three` and `three/addons/` at `vendor/three/` (three.js **r169**). |
 | `styles.css` | Design tokens (`:root` custom properties), gallery, viewer, and responsive and reduced-motion rules. Sections are numbered in the header comment. |
-| `main.js` | Gallery: loads the catalogue, normalises project objects, renders cards, search and phase filtering, **hash routing**, **stage discovery**, and the hover pan animation on cards. |
-| `viewer.js` | The 360° viewer: renderer and scene, **colour pipeline**, stage loading and cross-fade, timeline and filmstrip, adjustments, details panel (including a small EXIF parser), keyboard and XR input, per-project persistence. |
+| `main.js` | Gallery: loads the catalogue, normalises project objects, renders cards, search, phase filter, sort and grouping, the **map view**, **hash routing**, **stage discovery**, and the hover pan animation on cards. |
+| `viewer.js` | The 360° viewer: renderer and scene, **colour pipeline**, stage loading (thumbnail preview, 4K copies) and cross-fade, timeline and filmstrip, **split view**, **alignment**, **hotspots**, sharing and embed mode, the **editor**, adjustments, details panel, keyboard and XR input, per-project persistence. |
+| `exif.js` | `readExif(url)`: capture date and GPS from the first 128 KB of a JPEG (`Range` request), cached per URL. Used by the details panel and the map. |
 | `stages.js` | Stage **naming rules**, shared by the browser and the Node tools: classify a file name (numbered / dated / other), sort a folder into viewing order, and assign labels and dates. No DOM APIs. |
-| `sw.js` | Cache-first service worker for images under `/assets/`. |
-| `tools/` | `sync-projects.mjs` (writes stage lists and new projects into `projects.json`), plus the thumbnail generators (PowerShell and Node/sharp). |
+| `sw.js` | Service worker: cache-first panoramas, network-first app shell (offline support for the PWA). |
+| `vendor/` | Unmodified copies of three.js r169 (`three.module.js`, `OrbitControls`, `VRButton`) and Leaflet 1.9.4, with their licences. |
+| `tools/` | `sync-projects.mjs` (writes stage lists and new projects into `projects.json`, and validates it), plus the thumbnail/4K generators (PowerShell and Node/sharp). |
+| `tests/` | `server.mjs` (static server with HEAD/Range and optional listings) and `smoke.mjs` (Playwright smoke tests). |
 
 ## Startup and routing (`main.js`)
 
@@ -24,8 +28,10 @@ index.html ── loads ──> main.js (ES module) ── imports ──> viewe
 2. `normalizeProject()` fills in defaults (`slug`, `meta`, `campus`, `tags`).
 3. `renderChips()` and `renderGallery()` build the UI. Card elements are cached per project, so filtering never rebuilds them or restarts their thumbnail work.
 4. `route()` runs on load and on every `hashchange`:
-   - `#/<id>` → `openViewer({...project, stages: resolveStages(project)})`
+   - `#/<id>?stage=&yaw=&pitch=` → `openViewer({...project, stages: resolveStages(project)}, { stage, yaw, pitch })`
    - empty hash → `closeViewer()`
+
+   `setProjectDirectory()` gives the viewer an `id → title` map for hotspot links. `?embed=1` and `?edit` (before the `#`) are read once at startup by `viewer.js` (`EMBED_MODE`, `EDIT_MODE`).
 
    Cards are plain `<a href="#/<id>">` links, so middle-click, copy-link and the back button work naturally.
 5. **Closing** goes through `setCloseHandler()`. If the viewer was opened by clicking a card, closing calls `history.back()`, so the back button doesn't reopen it. Otherwise (a deep link) it clears the hash.
@@ -43,6 +49,12 @@ Every path ends in `describeStages()`, which adds a `label` (unless one was give
 Because a static host can't list folders, path 2 only works on dev servers or hosts with directory listing turned on. `tools/sync-projects.mjs` uses the same `stages.js` rules to write path 1 for production, so local and deployed ordering always match.
 
 An `IntersectionObserver` triggers discovery as each card scrolls into view. That fills in the card's stage count and video badge, and it means opening a project usually needs no network round-trips before the first image starts loading.
+
+### Sort, group and map
+
+`sortProjects()` and `groupKey()` feed `renderGallery()`, which inserts `h2.group-heading` elements into the grid between groups. The choices are stored under `p360:gallery:*`.
+
+The map view loads Leaflet on first use (`ensureLeaflet()`). `gpsFor()` uses `meta.gps`, or else reads EXIF GPS from the project's JPEG stages, except for projects whose `campus.campus` is `Private` or whose `meta.gps` is `false`. Projects within about 100 m of each other share a marker (rounded to 3 decimal places), with a popup listing them.
 
 ### Card hover animation
 
@@ -63,7 +75,17 @@ An `IntersectionObserver` triggers discovery as each card scrolls into view. Tha
 
 `state.pos` is a float from 0 to *n−1*. The material has two texture slots: `map1` holds stage `floor(pos)`, `map2` holds the next stage, and the `mixAmount` uniform is the fractional part. The timeline slider writes `pos` directly. **‹ ›**, the filmstrip and the keyboard call `animateTo()`, which sets up a tween. The tween advances inside the render loop rather than through `requestAnimationFrame`, so it also runs in XR, where the window's animation frames are paused.
 
-While stages are still streaming in, `textureAt(i)` falls back to the nearest stage that has loaded.
+While stages are still streaming in, `setSlots()` falls back to the nearest stage that has loaded.
+
+**Loading** (`loadStage()`): when `preferSmall()` is true (screen ≤ 900 px wide, or `maxTextureSize` ≤ 4096), a `-4k.jpg` sibling is used if `HEAD` finds one. The first stage is shown from its `-thumb.jpg` while the real image downloads (`{ preview: true }`), and `state.full[i]` records which stages have their final texture.
+
+**Alignment**: the shader samples `map1` at `uv.x + off1` and `map2` at `uv.x + off2`, where `off` is the stage's `align` value in turns (degrees ÷ 360). Textures use `RepeatWrapping` horizontally, so the offset wraps around the seam.
+
+**Split view**: the `split` uniform is the divider's x position in device pixels (`< 0` means off). Fragments left of it show `map1` (the left-hand stage), the rest show `map2`, compared on `gl_FragCoord.x`. `refreshTextures()` decides what goes in each slot: split view, aligning (previous stage at 50%), or the normal cross-fade.
+
+**Hotspots**: `buildHotspots()` creates one absolutely positioned element per hotspot visible on the current stage, and `positionHotspots()` projects each one's direction through the camera every frame, hiding it when it's behind the viewer or off-screen. The yaw/pitch convention is shared with share links and `view`: direction = (sin yaw · cos pitch, sin pitch, −cos yaw · cos pitch).
+
+**Editor** (`?edit`): `field(name)` reads `view`, `align` and `hotspots` from the draft (`localStorage["p360:draft:<id>"]`) when present, else from the project. Every change goes through `editDraft()`, which re-renders the textures, hotspots and the JSON export.
 
 **Playback** (`setPlaying()` / `advancePlayback()` / `holdStage()`) also runs in the render loop. When no tween is running and `now >= state.nextAt`, it fades to the next stage using `PLAY_FADE_MS`. When that fade finishes, it holds for `PLAY_HOLD_MS`. The loop from the last stage back to the first is a special `wrap` tween: it puts the last stage in `map1` and the first in `map2` and fades directly, rather than rewinding `pos` through every stage in between. Any manual navigation calls `setPlaying(false)`.
 
@@ -101,11 +123,11 @@ Adjustments are **per project**, not per stage, so before and after are always r
 
 ### Persistence
 
-`localStorage["p360:v2:<id>"] = { pos, view: [azimuth, polar], fov, adj }`. Writes are debounced (300 ms). Global preferences: `p360:sidebar` and `p360:hintSeen`.
+`localStorage["p360:v2:<id>"] = { pos, look: [yaw, pitch], fov, adj }`. Writes are debounced (300 ms). Global preferences: `p360:sidebar`, `p360:hintSeen` and `p360:gallery:*`. Start-up order: URL parameters, then saved `look`, then the project's `view`.
 
 ### Details panel
 
-`readExif()` fetches only the first 128 KB of a JPEG with a `Range` header, parses `DateTimeOriginal`/`DateTime` and GPS from APP1/TIFF, and caches the result per URL. Videos are never fetched for metadata.
+`readExif()` (in `exif.js`) fetches only the first 128 KB of a JPEG with a `Range` header, parses `DateTimeOriginal`/`DateTime` and GPS from APP1/TIFF, and caches the result per URL. GPS of exactly 0,0 is ignored. Videos are never fetched for metadata.
 
 ### Input
 
@@ -116,9 +138,14 @@ Adjustments are **per project**, not per stage, so before and after are always r
 
 ## Service worker (`sw.js`)
 
-- Intercepts only same-origin `GET` requests for `.jpg/.jpeg/.png/.webp/.avif` under `/assets/`, and never requests that carry a `Range` header.
-- **Cache-first**: once an image is cached it's never re-fetched, until `CACHE_VERSION` changes. Changing it deletes the old caches on activate.
-- Only full `200` responses are stored. Videos, JSON, HTML, JS and CSS always come from the network, so code and catalogue updates show up without a version bump.
+- Only same-origin `GET` requests without a `Range` header are handled.
+- **Images under `/assets/`**: cache-first in `<version>-images`. Once cached, an image is never re-fetched until `CACHE_VERSION` changes, which deletes the old caches on activate.
+- **App shell** (navigations, `.html/.js/.css/.json/.webmanifest/.svg/.png` outside `/assets/`, and `assets/projects.json`): network-first in `<version>-shell`, falling back to the cache when offline. Navigations match with `ignoreSearch`, so `?embed=1` and `?edit` still work offline. The core files are pre-cached on install.
+- Only full `200` responses are stored. Videos always come from the network.
+
+## Tests
+
+`npm test` runs `tests/smoke.mjs`: it starts `tests/server.mjs` on a free port, launches Chrome (`channel: 'chrome'`, or `CHROME_PATH`) with SwiftShader for WebGL, blocks map tile requests, and checks the gallery, sort/group, map, opening and rendering a project (by measuring the brightness of a screenshot), stepping stages, split view, share links, embed mode, the editor, and that phones request the 4K copies. Uncaught page errors and console errors fail the test they happen in.
 
 ## Extending
 
@@ -127,4 +154,5 @@ Adjustments are **per project**, not per stage, so before and after are always r
 | Add a new adjustment | Add a uniform and its math to `createPanoMaterial()`, an entry in `ADJUSTMENTS` and `DEFAULT_ADJ`, a mapping line in `applyAdjustments()`, and a `.slider` block with `id="adj-<key>"` in `index.html`. |
 | Support another image format | Add the extension to the `exists()` probing in `discoverStages()` (`main.js`), and to `isCacheableImage()` (`sw.js`) if it should be cached. Explicit `stages` lists already accept any format the browser can decode. |
 | Change the theme | Edit the tokens at the top of `styles.css`. The phase badge colours are under `.phase[data-phase=…]`. |
-| Upgrade three.js | Change both URLs in the import map in `index.html`. The viewer uses only `WebGLRenderer`, `ShaderMaterial`, `TextureLoader`, `VideoTexture`, `OrbitControls` and `VRButton`. |
+| Upgrade three.js | Replace the files in `vendor/three/` (`build/three.module.js` → `three.module.js`, plus `examples/jsm/controls/OrbitControls.js` and `examples/jsm/webxr/VRButton.js` → `addons/…`), update the version in this file, and run `npm test`. The viewer uses only `WebGLRenderer`, `ShaderMaterial`, `TextureLoader`, `VideoTexture`, `OrbitControls` and `VRButton`. |
+| Add a hotspot field | Read it in `buildHotspots()`, add an input to the editor panel and to the `ed.hsAdd` handler, and validate it in `validate()` in `tools/sync-projects.mjs`. |

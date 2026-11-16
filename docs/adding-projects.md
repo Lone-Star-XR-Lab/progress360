@@ -61,8 +61,9 @@ To use your own labels (for example "Demolition", "Framing", "Finished") or a di
 ### Let the sync script do the bookkeeping
 
 ```bash
-node tools/sync-projects.mjs --dry   # preview
-node tools/sync-projects.mjs         # write assets/projects.json
+npm run sync                          # = node tools/sync-projects.mjs: write assets/projects.json
+node tools/sync-projects.mjs --dry    # preview only
+npm run check                         # = --check: write nothing, fail if out of date or broken (used by CI)
 ```
 
 It needs only Node (no `npm install`). It:
@@ -71,9 +72,11 @@ It needs only Node (no `npm install`). It:
 - leaves hand-written `stages` lists (no `autoStages`) alone;
 - adds a new entry for any folder under `assets/` that has media but no project yet. **Edit its `title`, `meta` and `campus` afterwards**; its `id` (the link `#/<id>`) is the folder name, which you may want to shorten;
 - moves `meta.updated` forward to the newest dated stage;
-- warns about projects whose folder no longer exists.
+- then **validates** every entry and prints:
+  - **errors** (CI fails on these): duplicate `id`s, missing folders, stage files that don't exist, `align` keys or hotspot `stage`s that match no stage file, hotspot links to a project `id` that doesn't exist, and malformed `view`, `align`, `hotspots` or `meta.gps`;
+  - **warnings** (worth fixing, but they don't fail anything): empty `title`, `meta.phase`, `meta.description` or `meta.updated`, dates not in `YYYY-MM-DD`, a description copied from another project, and a missing `-thumb.jpg`.
 
-Run it again whenever you add, rename or remove dated files.
+Run it again whenever you add, rename or remove files, and after pasting from the editor.
 
 ### Or write the entry yourself
 
@@ -114,8 +117,14 @@ Add an object to the `projects` array. Every field except `id`, `title` and `fol
 | `meta.description` | no | Card blurb (two lines) and the About panel (full text). |
 | `campus.campus`, `.building`, `.room` | no | Joined into the "Site" line, e.g. *Lone Star College – Tomball · E Building · E251*. Empty strings are skipped. |
 | `tags` | no | Shown as `#tags` in the About panel. Searchable. |
+| `meta.gps` | no | Map position, `[lat, lon]` or `{"lat": …, "lon": …}`. Without it the map uses the GPS stored in the first photo that has one. `false` keeps the project off the map. |
 | `stages` | no | Explicit stage list (see below). Skips auto-discovery. |
 | `autoStages` | no | Set by `tools/sync-projects.mjs` on lists it generated. Remove it if you hand-edit that list, so the script stops regenerating it. |
+| `view` | no | Start view (see below). |
+| `align` | no | Per-stage rotation correction (see below). |
+| `hotspots` | no | Points of interest (see below). |
+
+**Privacy:** a project whose `campus.campus` is `"Private"` (for example someone's home) is never placed on the map from its photos' GPS. It only appears there if you give it a `meta.gps` yourself. The GPS is still inside the photo files, though, so anyone who downloads one can read it. If that matters, strip it before adding the photos (on Windows: *Properties → Details → Remove Properties and Personal Information*).
 
 The search box matches title, description, location, phase, campus/building/room and tags.
 
@@ -138,14 +147,49 @@ When `stages` is present, the viewer uses it in the order written and doesn't lo
 
 This also suits large projects, because it avoids the extra discovery requests.
 
-## 4. Thumbnails
+### Start view, alignment and hotspots
 
-Cards load a small thumbnail (about 1200 px wide) of the **first stage** instead of the full panorama: `000-kitchen.jpg` → `000-kitchen-thumb.jpg`, `20260216_C210.jpg` → `20260216_C210-thumb.jpg`. Generate it with either script. Both skip thumbnails that already exist:
+These three fields are easiest to create with the **editor**: open `index.html?edit#/<id>`, set things up by pointing and clicking, then **Copy JSON** and paste it into the project's entry (see [viewer.md → Editor](viewer.md#editor-for-content-editors)). Run `npm run check` afterwards. Written by hand, they look like this:
+
+```json
+{
+  "id": "xr-lab",
+  "title": "XR Lab",
+  "folder": "assets/xr-lab",
+  "view": { "yaw": 35, "pitch": -5, "fov": 75 },
+  "align": { "001-xr-lab.jpg": 12.5, "20261115_e251.jpg": -3 },
+  "hotspots": [
+    { "yaw": 0, "pitch": -10, "title": "VR stations", "text": "Six headset stations along the wall." },
+    { "yaw": 120, "pitch": 0, "title": "To the RIC", "link": "ric" },
+    { "yaw": -60, "pitch": 5, "title": "New screen", "stage": "20261115_e251.jpg" }
+  ]
+}
+```
+
+Angles are in degrees. **yaw** 0 is the centre of the panorama image and positive turns right (−180…180). **pitch** 0 is the horizon and positive looks up (−90…90).
+
+| Field | Meaning |
+|---|---|
+| `view.yaw`, `view.pitch`, `view.fov` | Where a visitor first looks, and the zoom (field of view, 30–100, default 75). **R** returns here. Visitors who have opened the project before return to where they left off. |
+| `align` | `{ "<stage file name>": degrees }`. Rotates that stage horizontally so it lines up with the stage before it. Use it when the camera was turned differently between visits. Hotspots and the view direction are not rotated. |
+| `hotspots[].yaw`, `.pitch` | Position of the dot. |
+| `hotspots[].title`, `.text` | Label next to the dot, and the note in its popup. Both optional, but give it at least one. |
+| `hotspots[].link` | Another project's `id`. The popup shows a **Go to …** button. |
+| `hotspots[].stage` | A stage file name. The hotspot is shown only on that stage. Without it, it's shown on every stage. |
+
+## 4. Thumbnails and 4K copies
+
+The generator scripts create two kinds of smaller file next to the originals:
+
+- **Thumbnail** of the **first stage**, about 1200 px wide: `000-kitchen.jpg` → `000-kitchen-thumb.jpg`, `20260216_C210.jpg` → `20260216_C210-thumb.jpg`. Cards and the filmstrip use it, and the viewer shows it while the full image loads.
+- **4K copy** of **every stage image wider than 4096 px**: `001-kitchen.jpg` → `001-kitchen-4k.jpg` (4096 × 2048, about 1 MB instead of 6–12 MB). Phones and GPUs that can't handle bigger textures load this instead of the original.
+
+Both are ignored as stages, and both scripts skip files that already exist:
 
 ```powershell
 # Windows, no dependencies
 powershell -ExecutionPolicy Bypass -File tools/generate-thumbs.ps1
-#   -Width 1200 -Quality 74 -WhatIf   (optional)
+#   -Width 1200 -Quality 74 -SmallWidth 4096 -SmallQuality 82 -No4k -WhatIf   (all optional)
 ```
 
 ```bash
@@ -153,16 +197,17 @@ powershell -ExecutionPolicy Bypass -File tools/generate-thumbs.ps1
 npm i --no-save sharp
 node tools/generate-thumbs.mjs            # all folders under assets/
 node tools/generate-thumbs.mjs assets/kitchen
-#   THUMB_WIDTH=1200 THUMB_QUALITY=74, --dry for a dry run
+#   THUMB_WIDTH, THUMB_QUALITY, SMALL_WIDTH, SMALL_QUALITY; --no-4k; --dry for a dry run
 ```
 
-To **regenerate** a thumbnail (for example after replacing the first image, or adding an older dated image that becomes the new first stage), delete the old `-thumb.jpg` first.
+To **regenerate** one (for example after replacing an image, or adding an older dated image that becomes the new first stage), delete the old `-thumb.jpg` or `-4k.jpg` first.
 
 If there's no thumbnail, the card falls back to `thumb` and then to the first stage image itself. It still works, but the gallery loads much more data.
 
 ## 5. Check it
 
-1. Start a local server (see the [README](../README.md#quick-start)) and reload the page.
+1. Run `npm run check` and fix any errors it lists.
+1. Start a local server (`npm run serve`, see the [README](../README.md#quick-start)) and reload the page.
 2. The card should appear with the right thumbnail and, after a moment, the stage count ("3 stages") and a **Video** badge if any stage is an MP4.
 3. Open it and step through each stage with ← →.
 
@@ -182,4 +227,7 @@ If there's no thumbnail, the card falls back to `thumb` and then to the first st
 | A dated file is in the wrong place or has a filename label | The date part isn't at the start of the name (or after a short prefix like `IMG_`), or it isn't a real date. |
 | Video stage is black | Not H.264 MP4, or the repo has only the LFS pointer (`git lfs pull`). |
 | Image looks dark or flat | That is how it was captured. Fix it in the source, or use the viewer's Auto/Exposure. Adjustments are saved per browser, not for everyone. |
-| Old image still shows after replacing it | Service worker cache: bump `CACHE_VERSION` in `sw.js`. |
+| Old image still shows after replacing it | Service worker cache: bump `CACHE_VERSION` in `sw.js`. Also delete and regenerate its `-4k.jpg` and `-thumb.jpg`. |
+| Stages seem to spin during a cross-fade | The camera faced a different way on each visit. Fix it with `align` (editor → **Align this stage**). |
+| A hotspot is in the wrong place on a later stage | Hotspots don't follow `align`. Give it a `stage` so it only shows where it fits, or add one per stage. |
+| Project missing from the map | No GPS in its photos and no `meta.gps`, or its site is `"Private"`. The note under the map lists projects without a location. |
