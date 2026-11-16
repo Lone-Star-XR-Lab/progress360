@@ -1,0 +1,16 @@
+{
+  "name": "progress360",
+  "private": true,
+  "description": "Before/after 360° panorama viewer for project stages. Static site, no build step.",
+  "type": "module",
+  "scripts": {
+    "serve": "node tests/server.mjs 8080",
+    "sync": "node tools/sync-projects.mjs",
+    "check": "node tools/sync-projects.mjs --check",
+    "thumbs": "node tools/generate-thumbs.mjs",
+    "test": "node tests/smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.49.1"
+  }
+}

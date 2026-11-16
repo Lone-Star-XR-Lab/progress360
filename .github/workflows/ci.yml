@@ -1,0 +1,70 @@
+# Checks every push and pull request:
+#   1. projects.json is in sync with assets/ and has no errors (tools/sync-projects.mjs --check)
+#   2. the site works in headless Chrome (tests/smoke.mjs)
+# Optionally deploys to GitHub Pages from main. Turn that on with a repository variable
+# DEPLOY_PAGES = true (Settings → Secrets and variables → Actions → Variables) and set
+# Settings → Pages → Source to "GitHub Actions". See docs/deployment.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true                      # videos (*.mp4) are stored in Git LFS
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: projects.json is up to date and valid
+        run: npm run check
+
+      - name: Smoke tests (headless Chrome)
+        run: npm test
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_PAGES == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true                      # Pages can't serve LFS pointers; check out the real files
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp -r index.html styles.css main.js viewer.js stages.js exif.js sw.js manifest.webmanifest icons vendor assets _site/
+          touch _site/.nojekyll
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
